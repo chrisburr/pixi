@@ -289,6 +289,8 @@ impl Workspace {
                     io_concurrency_limit: IoConcurrencyLimit::default(),
                     command_dispatcher,
                     glob_hash_cache,
+                    #[cfg(unix)]
+                    mount_guards: Default::default(),
                 },
                 false,
             ));
@@ -316,6 +318,8 @@ impl Workspace {
                     io_concurrency_limit: IoConcurrencyLimit::default(),
                     command_dispatcher,
                     glob_hash_cache,
+                    #[cfg(unix)]
+                    mount_guards: Default::default(),
                 },
                 false,
             ));
@@ -499,6 +503,12 @@ pub struct LockFileDerivedData<'p> {
 
     /// An object that caches input hashes
     pub glob_hash_cache: GlobHashCache,
+
+    /// Active mount guards for environments using the "mount" backend.
+    /// Kept alive so the shared flock persists until this struct is dropped.
+    #[cfg(unix)]
+    pub mount_guards:
+        DashMap<EnvironmentName, crate::environment::mount_sidecar::MountGuard>,
 }
 
 /// The mode to use when updating a prefix.
@@ -672,6 +682,32 @@ impl<'p> LockFileDerivedData<'p> {
                     "Cannot install environment '{}'",
                     environment.name().fancy_display()
                 ))?;
+
+                // If using mount backend, mount the environment instead of
+                // linking packages.
+                #[cfg(unix)]
+                if self.workspace.config().environment_backend()
+                    == pixi_config::EnvironmentBackend::Mount
+                {
+                    let env_dir = environment.dir();
+                    let guard = crate::environment::mount_sidecar::ensure_mount(
+                        &env_dir,
+                        self.workspace.root(),
+                        environment.name().as_str(),
+                    )
+                    .await?;
+
+                    // Store the guard so it lives as long as this LockFileDerivedData
+                    self.mount_guards
+                        .insert(environment.name().clone(), guard);
+
+                    tracing::info!(
+                        "environment '{}' mounted at {}",
+                        environment.name().fancy_display(),
+                        env_dir.display()
+                    );
+                    return Ok(Prefix::new(env_dir));
+                }
 
                 let platform = environment.best_platform();
                 let locked_env = self.locked_env(environment)?;
@@ -2111,6 +2147,8 @@ impl<'p> UpdateContext<'p> {
             io_concurrency_limit: self.io_concurrency_limit,
             command_dispatcher: self.command_dispatcher,
             glob_hash_cache: self.glob_hash_cache,
+            #[cfg(unix)]
+            mount_guards: Default::default(),
         })
     }
 }
