@@ -447,6 +447,53 @@ impl Default for DetachedEnvironments {
     }
 }
 
+/// How environments are materialised on disk.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnvironmentBackend {
+    /// Traditional: extract and hardlink packages into the environment directory.
+    #[default]
+    Link,
+    /// Virtual: serve packages via a mounted filesystem (FUSE or NFS).
+    Mount,
+}
+
+impl std::str::FromStr for EnvironmentBackend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "link" => Ok(Self::Link),
+            "mount" => Ok(Self::Mount),
+            _ => Err(format!("unknown environment backend: {s} (expected 'link' or 'mount')")),
+        }
+    }
+}
+
+/// Transport backend for mounted environments.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountBackend {
+    /// Auto-detect: NFS on macOS, FUSE on Linux.
+    #[default]
+    Auto,
+    /// NFS userspace server (no kernel extension required on macOS).
+    Nfs,
+    /// FUSE (requires libfuse3 on Linux, macFUSE on macOS).
+    Fuse,
+}
+
+impl std::str::FromStr for MountBackend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "nfs" => Ok(Self::Nfs),
+            "fuse" => Ok(Self::Fuse),
+            _ => Err(format!("unknown mount backend: {s} (expected 'auto', 'nfs', or 'fuse')")),
+        }
+    }
+}
+
 #[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct ExperimentalConfig {
@@ -456,6 +503,21 @@ pub struct ExperimentalConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_environment_activation_cache: Option<bool>,
+
+    /// How environments are materialised: "link" (default) or "mount".
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_backend: Option<EnvironmentBackend>,
+
+    /// Transport for mounted environments: "auto" (default), "nfs", or "fuse".
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_backend: Option<MountBackend>,
+
+    /// When true, mounted environments are read-only (no writable overlay).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_read_only: Option<bool>,
 }
 
 impl ExperimentalConfig {
@@ -464,6 +526,11 @@ impl ExperimentalConfig {
             use_environment_activation_cache: other
                 .use_environment_activation_cache
                 .or(self.use_environment_activation_cache),
+            environment_backend: other
+                .environment_backend
+                .or(self.environment_backend),
+            mount_backend: other.mount_backend.or(self.mount_backend),
+            mount_read_only: other.mount_read_only.or(self.mount_read_only),
         }
     }
     pub fn use_environment_activation_cache(&self) -> bool {
@@ -472,6 +539,9 @@ impl ExperimentalConfig {
 
     pub fn is_default(&self) -> bool {
         self.use_environment_activation_cache.is_none()
+            && self.environment_backend.is_none()
+            && self.mount_backend.is_none()
+            && self.mount_read_only.is_none()
     }
 }
 
@@ -883,6 +953,7 @@ impl From<ConfigCli> for Config {
                 } else {
                     None
                 },
+                ..Default::default()
             },
             pinning_strategy: cli.pinning_strategy,
             ..Default::default()
@@ -1376,6 +1447,9 @@ impl Config {
             "default-channels",
             "detached-environments",
             "experimental",
+            "experimental.environment-backend",
+            "experimental.mount-backend",
+            "experimental.mount-read-only",
             "experimental.use-environment-activation-cache",
             "mirrors",
             "pinning-strategy",
@@ -1523,6 +1597,36 @@ impl Config {
 
     pub fn experimental_activation_cache_usage(&self) -> bool {
         self.experimental.use_environment_activation_cache()
+    }
+
+    /// How environments are materialised. Env var `PIXI_ENVIRONMENT_BACKEND`
+    /// takes precedence over the config file value.
+    pub fn environment_backend(&self) -> EnvironmentBackend {
+        std::env::var("PIXI_ENVIRONMENT_BACKEND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(self.experimental.environment_backend)
+            .unwrap_or_default()
+    }
+
+    /// Transport for mounted environments. Env var `PIXI_MOUNT_BACKEND`
+    /// takes precedence over the config file value.
+    pub fn mount_backend(&self) -> MountBackend {
+        std::env::var("PIXI_MOUNT_BACKEND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(self.experimental.mount_backend)
+            .unwrap_or_default()
+    }
+
+    /// Whether mounted environments are read-only. Env var
+    /// `PIXI_MOUNT_READ_ONLY` takes precedence.
+    pub fn mount_read_only(&self) -> bool {
+        std::env::var("PIXI_MOUNT_READ_ONLY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(self.experimental.mount_read_only)
+            .unwrap_or(false)
     }
 
     /// Retrieve the value for the max_concurrent_solves field.
@@ -1806,6 +1910,22 @@ impl Config {
                 match subkey {
                     "use-environment-activation-cache" => {
                         self.experimental.use_environment_activation_cache =
+                            value.map(|v| v.parse()).transpose().into_diagnostic()?;
+                    }
+                    "environment-backend" => {
+                        self.experimental.environment_backend = value
+                            .map(|v| v.parse::<EnvironmentBackend>())
+                            .transpose()
+                            .map_err(|e| miette!("{e}"))?;
+                    }
+                    "mount-backend" => {
+                        self.experimental.mount_backend = value
+                            .map(|v| v.parse::<MountBackend>())
+                            .transpose()
+                            .map_err(|e| miette!("{e}"))?;
+                    }
+                    "mount-read-only" => {
+                        self.experimental.mount_read_only =
                             value.map(|v| v.parse()).transpose().into_diagnostic()?;
                     }
                     _ => return Err(err),
@@ -2280,6 +2400,7 @@ UNUSED = "unused"
             pinning_strategy: Some(PinningStrategy::NoPin),
             experimental: ExperimentalConfig {
                 use_environment_activation_cache: Some(true),
+                ..Default::default()
             },
             loaded_from: Vec::from([PathBuf::from_str("test").unwrap()]),
             shell: ShellConfig {
