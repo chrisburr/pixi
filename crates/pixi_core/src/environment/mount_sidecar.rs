@@ -47,8 +47,16 @@ pub struct MountGuard {
 
 impl MountGuard {
     /// The path to the overlay directory for this environment.
+    ///
+    /// Lives in the parent directory of `env_dir` (not inside the mount point)
+    /// to avoid routing writes through the NFS server.
     pub fn overlay_dir(env_dir: &Path) -> PathBuf {
-        env_dir.join(OVERLAY_DIRNAME)
+        let parent = env_dir.parent().expect("env_dir has no parent");
+        let name = env_dir
+            .file_name()
+            .expect("env_dir has no file name")
+            .to_string_lossy();
+        parent.join(format!("{name}{OVERLAY_DIRNAME}"))
     }
 }
 
@@ -86,13 +94,24 @@ impl Drop for MountGuard {
 #[cfg(unix)]
 pub async fn ensure_mount(
     env_dir: &Path,
-    _workspace_root: &Path,
-    _environment_name: &str,
+    workspace_root: &Path,
+    environment_name: &str,
 ) -> miette::Result<MountGuard> {
     fs::create_dir_all(env_dir).into_diagnostic()?;
 
-    let lock_path = env_dir.join(LOCK_FILENAME);
-    let pid_path = env_dir.join(PID_FILENAME);
+    // Coordination files live in the parent directory of the mount point,
+    // because the mount point itself will be overlaid by the NFS mount and
+    // the sidecar process that hosts the NFS server cannot write through
+    // its own mount without deadlocking.
+    let parent_dir = env_dir
+        .parent()
+        .ok_or_else(|| miette!("env_dir has no parent: {}", env_dir.display()))?;
+    let env_basename = env_dir
+        .file_name()
+        .ok_or_else(|| miette!("env_dir has no file name: {}", env_dir.display()))?
+        .to_string_lossy();
+    let lock_path = parent_dir.join(format!("{env_basename}{LOCK_FILENAME}"));
+    let pid_path = parent_dir.join(format!("{env_basename}{PID_FILENAME}"));
 
     let lock_file = OpenOptions::new()
         .create(true)
@@ -112,7 +131,7 @@ pub async fn ensure_mount(
         cleanup_stale_state(env_dir, &pid_path)?;
 
         // Start the sidecar
-        start_sidecar(env_dir, &lock_file, &pid_path).await?;
+        start_sidecar(env_dir, workspace_root, environment_name, &lock_file, &pid_path).await?;
 
         // Downgrade to shared lock
         let ret = unsafe { libc::flock(fd, libc::LOCK_SH) };
@@ -136,7 +155,7 @@ pub async fn ensure_mount(
                 drop(lock_file);
                 cleanup_stale_state(env_dir, &pid_path)?;
                 // Recursive retry (bounded by stale cleanup)
-                return Box::pin(ensure_mount(env_dir, _workspace_root, _environment_name)).await;
+                return Box::pin(ensure_mount(env_dir, workspace_root, environment_name)).await;
             }
         } else {
             return Err(miette!("failed to acquire lock: {err}"));
@@ -157,6 +176,8 @@ pub async fn ensure_mount(
 #[cfg(unix)]
 async fn start_sidecar(
     env_dir: &Path,
+    workspace_root: &Path,
+    environment_name: &str,
     _lock_file: &File,
     pid_path: &Path,
 ) -> miette::Result<()> {
@@ -177,10 +198,12 @@ async fn start_sidecar(
     // Spawn the sidecar as a detached child process.
     // We use Command::new rather than fork() for simplicity — the sidecar
     // daemonizes itself internally.
-    let mut child = std::process::Command::new(&pixi_exe)
-        .args([
+    let mut cmd = std::process::Command::new(&pixi_exe);
+    cmd.args([
             "mount",
             "--managed",
+            "-e",
+            environment_name,
             "--mount-point",
             &env_dir_str,
             "--pidfile",
@@ -188,11 +211,28 @@ async fn start_sidecar(
             "--ready-fd",
             &write_fd_str,
         ])
+        .current_dir(workspace_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .into_diagnostic()?;
+        .stderr(std::process::Stdio::inherit());
+
+    // Clear the CLOEXEC flag on write_fd so the child inherits it
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        let fd = write_fd;
+        cmd.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().into_diagnostic()?;
 
     // Close the write end in the parent
     unsafe { libc::close(write_fd); }

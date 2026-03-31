@@ -220,6 +220,7 @@ coalesced_map = "0.1.2"
 file_url = "0.2.7"
 rattler = { version = "0.40.3", default-features = false }
 rattler_cache = { version = "0.6.18", default-features = false }
+rattler_fs = { version = "0.1.0" }
 rattler_conda_types = { version = "0.44.3", default-features = false, features = [
   "rayon",
 ] }
@@ -255,6 +256,26 @@ rattler_build_types = { version = "0.1.3" }
 rattler_build_variant_config = { version = "0.1.3" }
 
 [patch.crates-io]
+coalesced_map = { path = "/Users/cburr/Development/rattler/crates/coalesced_map" }
+file_url = { path = "/Users/cburr/Development/rattler/crates/file_url" }
+path_resolver = { path = "/Users/cburr/Development/rattler/crates/path_resolver" }
+rattler = { path = "/Users/cburr/Development/rattler/crates/rattler" }
+rattler_cache = { path = "/Users/cburr/Development/rattler/crates/rattler_cache" }
+rattler_conda_types = { path = "/Users/cburr/Development/rattler/crates/rattler_conda_types" }
+rattler_digest = { path = "/Users/cburr/Development/rattler/crates/rattler_digest" }
+rattler_fs = { path = "/Users/cburr/Development/rattler/crates/rattler_fs" }
+rattler_index = { path = "/Users/cburr/Development/rattler/crates/rattler_index" }
+rattler_lock = { path = "/Users/cburr/Development/rattler/crates/rattler_lock" }
+rattler_menuinst = { path = "/Users/cburr/Development/rattler/crates/rattler_menuinst" }
+rattler_networking = { path = "/Users/cburr/Development/rattler/crates/rattler_networking" }
+rattler_package_streaming = { path = "/Users/cburr/Development/rattler/crates/rattler_package_streaming" }
+rattler_repodata_gateway = { path = "/Users/cburr/Development/rattler/crates/rattler_repodata_gateway" }
+rattler_s3 = { path = "/Users/cburr/Development/rattler/crates/rattler_s3" }
+rattler_shell = { path = "/Users/cburr/Development/rattler/crates/rattler_shell" }
+rattler_solve = { path = "/Users/cburr/Development/rattler/crates/rattler_solve" }
+rattler_upload = { path = "/Users/cburr/Development/rattler/crates/rattler_upload" }
+rattler_virtual_packages = { path = "/Users/cburr/Development/rattler/crates/rattler_virtual_packages" }
+simple_spawn_blocking = { path = "/Users/cburr/Development/rattler/crates/simple_spawn_blocking" }
 # This is a temporary patch to get `cargo vendor` to work with the `uv` and pep508_rs` crates.
 reqwest-middleware = { git = "https://github.com/astral-sh/reqwest-middleware", rev = "7650ed76215a962a96d94a79be71c27bffde7ab2" }
 reqwest-retry = { git = "https://github.com/astral-sh/reqwest-middleware", rev = "7650ed76215a962a96d94a79be71c27bffde7ab2" }

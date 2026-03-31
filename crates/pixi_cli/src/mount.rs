@@ -8,6 +8,9 @@ use pixi_core::{
     environment::get_update_lock_file_and_prefix,
     lock_file::{ReinstallPackages, UpdateMode},
 };
+use rattler::package_cache::PackageCache;
+use rattler_conda_types::Platform;
+use rattler_lock::DEFAULT_ENVIRONMENT_NAME;
 
 use crate::cli_config::{LockAndInstallConfig, WorkspaceConfig};
 
@@ -58,52 +61,216 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         .with_cli_config(config);
 
     let environment = workspace.environment_from_name_or_env_var(args.environment)?;
-
-    // Ensure lock file is up-to-date and packages are cached.
-    let (_lock_file_data, _prefix) = get_update_lock_file_and_prefix(
-        &environment,
-        UpdateMode::Revalidate,
-        UpdateLockFileOptions {
-            lock_file_usage: args.lock_and_install_config.lock_file_usage()?,
-            no_install: args.lock_and_install_config.no_install(),
-            max_concurrent_solves: workspace.config().max_concurrent_solves(),
-        },
-        ReinstallPackages::default(),
-        &pixi_core::environment::InstallFilter::default(),
-    )
-    .await?;
-
     let env_dir = environment.dir();
     let mount_point = args.mount_point.unwrap_or_else(|| env_dir.clone());
+    let platform = environment.best_platform();
+
+    let env_name = environment.name().as_str();
+    let env_name = if env_name.is_empty() {
+        DEFAULT_ENVIRONMENT_NAME
+    } else {
+        env_name
+    };
+
+    // Determine overlay based on read-only config
+    let overlay_dir = if workspace.config().mount_read_only() {
+        None
+    } else {
+        Some(pixi_core::environment::mount_sidecar::MountGuard::overlay_dir(&env_dir))
+    };
+
+    let transport = match workspace.config().mount_backend() {
+        pixi_config::MountBackend::Auto => rattler_fs::Transport::Auto,
+        pixi_config::MountBackend::Nfs => rattler_fs::Transport::Nfs,
+        pixi_config::MountBackend::Fuse => rattler_fs::Transport::Fuse,
+    };
 
     if args.managed {
-        execute_managed(&mount_point, args.pidfile.as_deref(), args.ready_fd).await
+        // The managed sidecar is spawned by ensure_mount after the parent has
+        // already solved and cached packages. Just load the existing lock file
+        // and package cache — no solve needed.
+        let lock_file = rattler_lock::LockFile::from_path(&workspace.lock_file_path())
+            .into_diagnostic()?;
+        let package_cache = PackageCache::new(
+            pixi_config::get_cache_dir()?
+                .join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR),
+        );
+
+        let env_hash = rattler_fs::compute_env_hash(&lock_file, env_name, platform)
+            .map_err(|e| miette::miette!("failed to compute env hash: {e}"))?;
+
+        execute_managed(
+            &lock_file,
+            env_name,
+            platform,
+            &package_cache,
+            &mount_point,
+            overlay_dir,
+            &env_hash,
+            transport,
+            args.pidfile.as_deref(),
+            args.ready_fd,
+        )
+        .await
     } else {
-        execute_interactive(&mount_point).await
+        // Interactive mode: ensure lock file is up-to-date and packages are
+        // cached (but skip the hardlink install — the mount replaces it).
+        let (lock_file_data, _prefix) = get_update_lock_file_and_prefix(
+            &environment,
+            UpdateMode::Revalidate,
+            UpdateLockFileOptions {
+                lock_file_usage: args.lock_and_install_config.lock_file_usage()?,
+                no_install: true,
+                max_concurrent_solves: workspace.config().max_concurrent_solves(),
+            },
+            ReinstallPackages::default(),
+            &pixi_core::environment::InstallFilter::default(),
+        )
+        .await?;
+
+        let env_hash =
+            rattler_fs::compute_env_hash(&lock_file_data.lock_file, env_name, platform)
+                .map_err(|e| miette::miette!("failed to compute env hash: {e}"))?;
+
+        execute_interactive(
+            &lock_file_data.lock_file,
+            env_name,
+            platform,
+            &lock_file_data.package_cache,
+            &mount_point,
+            overlay_dir,
+            &env_hash,
+            transport,
+        )
+        .await
     }
 }
 
-async fn execute_interactive(mount_point: &std::path::Path) -> miette::Result<()> {
-    // TODO: Phase 4/5 — call rattler_fs::build_and_mount() here
+#[allow(clippy::too_many_arguments)]
+async fn execute_interactive(
+    lock_file: &rattler_lock::LockFile,
+    environment_name: &str,
+    platform: Platform,
+    package_cache: &PackageCache,
+    mount_point: &std::path::Path,
+    overlay_dir: Option<PathBuf>,
+    env_hash: &str,
+    transport: rattler_fs::Transport,
+) -> miette::Result<()> {
+    std::fs::create_dir_all(mount_point).into_diagnostic()?;
+
+    let config = if let Some(overlay_dir) = overlay_dir {
+        rattler_fs::MountConfig::new_writable(
+            mount_point.to_path_buf(),
+            Some(overlay_dir),
+            transport,
+            env_hash.to_string(),
+        )
+    } else {
+        rattler_fs::MountConfig::new_read_only(
+            mount_point.to_path_buf(),
+            transport,
+            env_hash.to_string(),
+        )
+    };
+
+    let _handle =
+        rattler_fs::build_and_mount(lock_file, environment_name, platform, package_cache, &config)
+            .await
+            .map_err(|e| miette::miette!("failed to mount: {e}"))?;
+
     eprintln!(
-        "Would mount environment at {}. (not yet implemented)",
+        "Mounted at {}. Press Ctrl+C to unmount.",
         mount_point.display()
     );
-    eprintln!("Press Ctrl+C to exit.");
 
+    // Wait for Ctrl+C or SIGTERM
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .into_diagnostic()?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c().await.into_diagnostic()?;
+
+    // _handle drops here, triggering unmount
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_managed(
+    lock_file: &rattler_lock::LockFile,
+    environment_name: &str,
+    platform: Platform,
+    package_cache: &PackageCache,
     mount_point: &std::path::Path,
-    _pidfile: Option<&std::path::Path>,
-    _ready_fd: Option<i32>,
+    overlay_dir: Option<PathBuf>,
+    env_hash: &str,
+    transport: rattler_fs::Transport,
+    pidfile: Option<&std::path::Path>,
+    ready_fd: Option<i32>,
 ) -> miette::Result<()> {
-    // TODO: Phase 4 — daemonize, mount, write pidfile, signal readiness, wait for SIGTERM
-    eprintln!(
-        "Would start managed mount sidecar at {}. (not yet implemented)",
-        mount_point.display()
-    );
+    std::fs::create_dir_all(mount_point).into_diagnostic()?;
+
+    let config = if let Some(overlay_dir) = overlay_dir {
+        rattler_fs::MountConfig::new_writable(
+            mount_point.to_path_buf(),
+            Some(overlay_dir),
+            transport,
+            env_hash.to_string(),
+        )
+    } else {
+        rattler_fs::MountConfig::new_read_only(
+            mount_point.to_path_buf(),
+            transport,
+            env_hash.to_string(),
+        )
+    };
+
+    let _handle =
+        rattler_fs::build_and_mount(lock_file, environment_name, platform, package_cache, &config)
+            .await
+            .map_err(|e| miette::miette!("failed to mount: {e}"))?;
+
+    // Write PID file
+    if let Some(pidfile) = pidfile {
+        std::fs::write(pidfile, format!("{}\n", std::process::id())).into_diagnostic()?;
+    }
+
+    // Signal readiness via pipe
+    #[cfg(unix)]
+    if let Some(fd) = ready_fd {
+        use std::os::unix::io::FromRawFd;
+        let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+        use std::io::Write;
+        let _ = pipe.write_all(b"ready\n");
+        // pipe is dropped/closed here
+    }
+
+    // Wait for SIGTERM
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .into_diagnostic()?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.into_diagnostic()?;
+
+    // Clean up pidfile
+    if let Some(pidfile) = pidfile {
+        let _ = std::fs::remove_file(pidfile);
+    }
+
+    // _handle drops here, triggering unmount
     Ok(())
 }

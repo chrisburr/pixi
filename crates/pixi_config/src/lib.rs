@@ -1599,14 +1599,9 @@ impl Config {
         self.experimental.use_environment_activation_cache()
     }
 
-    /// How environments are materialised. Env var `PIXI_ENVIRONMENT_BACKEND`
-    /// takes precedence over the config file value.
+    /// How environments are materialised.
     pub fn environment_backend(&self) -> EnvironmentBackend {
-        std::env::var("PIXI_ENVIRONMENT_BACKEND")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(self.experimental.environment_backend)
-            .unwrap_or_default()
+        self.experimental.environment_backend.unwrap_or_default()
     }
 
     /// Transport for mounted environments. Env var `PIXI_MOUNT_BACKEND`

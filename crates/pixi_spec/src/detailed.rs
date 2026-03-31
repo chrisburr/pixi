@@ -81,6 +81,7 @@ impl DetailedSpec {
             extras: Default::default(),
             condition: None,
             track_features: None,
+            license_family: None,
         })
     }
 }
