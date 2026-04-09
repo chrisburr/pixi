@@ -270,7 +270,7 @@ async fn start_sidecar(
 
 /// Check if the sidecar process is still alive.
 #[cfg(unix)]
-fn is_sidecar_alive(pid_path: &Path) -> bool {
+pub fn is_sidecar_alive(pid_path: &Path) -> bool {
     let Ok(pid_str) = fs::read_to_string(pid_path) else {
         return false;
     };
