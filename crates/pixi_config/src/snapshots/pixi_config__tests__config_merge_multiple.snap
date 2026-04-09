@@ -1,5 +1,6 @@
 ---
 source: crates/pixi_config/src/lib.rs
+assertion_line: 2567
 expression: debug
 ---
 Config {
@@ -132,6 +133,7 @@ Config {
         environment_backend: None,
         mount_backend: None,
         mount_read_only: None,
+        mount_grace_period: None,
     },
     concurrency: ConcurrencyConfig {
         solves: 1,

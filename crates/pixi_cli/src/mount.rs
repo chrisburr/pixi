@@ -99,6 +99,8 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         let env_hash = rattler_fs::compute_env_hash(&lock_file, env_name, platform)
             .map_err(|e| miette::miette!("failed to compute env hash: {e}"))?;
 
+        let grace_period = workspace.config().mount_grace_period();
+
         execute_managed(
             &lock_file,
             env_name,
@@ -108,6 +110,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
             overlay_dir,
             &env_hash,
             transport,
+            grace_period,
             args.pidfile.as_deref(),
             args.ready_fd,
         )
@@ -212,6 +215,7 @@ async fn execute_managed(
     overlay_dir: Option<PathBuf>,
     env_hash: &str,
     transport: rattler_fs::Transport,
+    grace_period: u64,
     pidfile: Option<&std::path::Path>,
     ready_fd: Option<i32>,
 ) -> miette::Result<()> {
@@ -252,17 +256,62 @@ async fn execute_managed(
         // pipe is dropped/closed here
     }
 
-    // Wait for SIGTERM
+    // Poll for client activity using the lock file. When no clients hold a
+    // shared lock for `grace_period` seconds, shut down.
     #[cfg(unix)]
     {
+        use std::os::unix::io::AsRawFd;
+
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .into_diagnostic()?;
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
+
+        let (lock_path, _) =
+            pixi_core::environment::mount_sidecar::coordination_paths(mount_point);
+
+        let probe_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&lock_path)
+            .into_diagnostic()?;
+        let probe_fd = probe_file.as_raw_fd();
+
+        let mut idle_seconds: u64 = 0;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        // Skip the immediate first tick to avoid racing with the parent
+        // acquiring LOCK_SH after receiving the readiness signal.
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let ret = unsafe { libc::flock(probe_fd, libc::LOCK_EX | libc::LOCK_NB) };
+                    if ret == 0 {
+                        // No clients hold shared locks. Release immediately.
+                        unsafe { libc::flock(probe_fd, libc::LOCK_UN); }
+                        idle_seconds += 1;
+                        if idle_seconds >= grace_period {
+                            tracing::info!(
+                                "grace period expired ({grace_period}s), shutting down sidecar"
+                            );
+                            break;
+                        }
+                    } else {
+                        // Clients active, reset timer.
+                        idle_seconds = 0;
+                    }
+                }
+                _ = sigterm.recv() => {
+                    tracing::debug!("sidecar received SIGTERM, shutting down");
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::debug!("sidecar received Ctrl+C, shutting down");
+                    break;
+                }
+            }
         }
     }
+
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await.into_diagnostic()?;
 

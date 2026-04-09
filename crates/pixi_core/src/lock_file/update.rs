@@ -576,6 +576,23 @@ impl<'p> LockFileDerivedData<'p> {
         if update_mode == UpdateMode::QuickValidate
             && let Some(prefix) = self.cached_prefix(environment, &hash)
         {
+            // Even when the prefix is cached, we still need to ensure the mount
+            // is active and acquire a shared lock so the sidecar isn't killed
+            // while we're using it.
+            #[cfg(unix)]
+            if self.workspace.config().environment_backend()
+                == pixi_config::EnvironmentBackend::Mount
+            {
+                let env_dir = environment.dir();
+                let guard = crate::environment::mount_sidecar::ensure_mount(
+                    &env_dir,
+                    self.workspace.root(),
+                    environment.name().as_str(),
+                )
+                .await?;
+                self.mount_guards
+                    .insert(environment.name().clone(), guard);
+            }
             return prefix;
         }
 

@@ -6,19 +6,25 @@
 //!
 //! ## Protocol
 //!
-//! Per-environment files:
-//! - `.rattler-fs.lock` — flock coordination file
-//! - `.rattler-fs.pid` — sidecar process PID
-//! - `.rattler-fs-overlay/` — writable overlay storage
+//! Per-environment coordination files (in the parent directory of the mount
+//! point to avoid routing I/O through the NFS server):
+//! - `{name}.rattler-fs.lock` — flock coordination file
+//! - `{name}.rattler-fs.pid` — sidecar process PID
 //!
 //! ### Client side (pixi run/shell):
-//! 1. Try `flock(LOCK_EX | LOCK_NB)` on `.rattler-fs.lock`
-//!    - Success → first user: fork sidecar, wait for readiness, downgrade to LOCK_SH
+//! 1. Try `flock(LOCK_EX | LOCK_NB)` on lock file
+//!    - Success + sidecar alive → reuse (grace period): downgrade to LOCK_SH
+//!    - Success + sidecar dead → start sidecar, downgrade to LOCK_SH
 //!    - EWOULDBLOCK → mount exists: acquire LOCK_SH, verify sidecar alive
 //! 2. Run user's command
-//! 3. On drop: release LOCK_SH, try LOCK_EX non-blocking
-//!    - Success → last user: SIGTERM the sidecar via pidfile
-//!    - EWOULDBLOCK → other users still active, do nothing
+//! 3. On drop: release LOCK_SH (sidecar manages its own lifetime)
+//!
+//! ### Sidecar side:
+//! 1. Mount, write PID, signal readiness
+//! 2. Poll for client activity: try LOCK_EX on lock file every second
+//!    - Success (no clients) → increment idle counter
+//!    - Fail (clients active) → reset idle counter
+//! 3. When idle >= grace period → unmount and exit
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -34,15 +40,32 @@ const LOCK_FILENAME: &str = ".rattler-fs.lock";
 const PID_FILENAME: &str = ".rattler-fs.pid";
 const OVERLAY_DIRNAME: &str = ".rattler-fs-overlay";
 
+/// Derive the coordination file paths for a given mount point.
+///
+/// Both the lock file and PID file live in the parent directory of the mount
+/// point, prefixed with the mount point's basename. This avoids routing I/O
+/// through the NFS server that the sidecar hosts.
+pub fn coordination_paths(mount_point: &Path) -> (PathBuf, PathBuf) {
+    let parent = mount_point.parent().expect("mount_point has no parent");
+    let basename = mount_point
+        .file_name()
+        .expect("mount_point has no file name")
+        .to_string_lossy();
+    (
+        parent.join(format!("{basename}{LOCK_FILENAME}")),
+        parent.join(format!("{basename}{PID_FILENAME}")),
+    )
+}
+
 /// RAII guard that holds a shared flock on the mount coordination file.
 ///
-/// When dropped, releases the shared lock and — if this was the last holder —
-/// sends SIGTERM to the sidecar process.
+/// When dropped, releases the shared lock. The sidecar manages its own
+/// lifetime via its polling loop and grace period.
 pub struct MountGuard {
+    #[allow(dead_code)]
     lock_file: File,
-    #[allow(dead_code)] // used for debugging; kept for potential future use
+    #[allow(dead_code)]
     lock_path: PathBuf,
-    pid_path: PathBuf,
 }
 
 impl MountGuard {
@@ -63,33 +86,15 @@ impl MountGuard {
 #[cfg(unix)]
 impl Drop for MountGuard {
     fn drop(&mut self) {
-        // Release the shared lock (happens implicitly when fd closes, but we
-        // need to try upgrading first).
-
-        // Try to acquire exclusive lock (non-blocking). If successful, we are
-        // the last user and should signal the sidecar to shut down.
-        let fd = self.lock_file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if ret == 0 {
-            // We got exclusive lock — no other clients. Kill the sidecar.
-            if let Ok(pid_str) = fs::read_to_string(&self.pid_path) {
-                if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    tracing::debug!("last mount client exiting, sending SIGTERM to sidecar pid {pid}");
-                    unsafe {
-                        libc::kill(pid, libc::SIGTERM);
-                    }
-                }
-            }
-            // Clean up the pidfile
-            let _ = fs::remove_file(&self.pid_path);
-        }
-        // Lock is released when lock_file is dropped
+        // The shared lock is released when lock_file is dropped.
+        // The sidecar manages its own lifetime via its polling loop.
     }
 }
 
 /// Ensure a mount is running for the given environment directory.
 ///
 /// If no sidecar is running, starts one (by invoking `pixi mount --managed`).
+/// If a sidecar is alive in its grace period, reuses it.
 /// Returns a guard that keeps the shared flock alive.
 #[cfg(unix)]
 pub async fn ensure_mount(
@@ -99,19 +104,7 @@ pub async fn ensure_mount(
 ) -> miette::Result<MountGuard> {
     fs::create_dir_all(env_dir).into_diagnostic()?;
 
-    // Coordination files live in the parent directory of the mount point,
-    // because the mount point itself will be overlaid by the NFS mount and
-    // the sidecar process that hosts the NFS server cannot write through
-    // its own mount without deadlocking.
-    let parent_dir = env_dir
-        .parent()
-        .ok_or_else(|| miette!("env_dir has no parent: {}", env_dir.display()))?;
-    let env_basename = env_dir
-        .file_name()
-        .ok_or_else(|| miette!("env_dir has no file name: {}", env_dir.display()))?
-        .to_string_lossy();
-    let lock_path = parent_dir.join(format!("{env_basename}{LOCK_FILENAME}"));
-    let pid_path = parent_dir.join(format!("{env_basename}{PID_FILENAME}"));
+    let (lock_path, pid_path) = coordination_paths(env_dir);
 
     let lock_file = OpenOptions::new()
         .create(true)
@@ -126,17 +119,24 @@ pub async fn ensure_mount(
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
 
     if ret == 0 {
-        // We got exclusive lock — no sidecar running.
-        // Check for stale state first.
-        cleanup_stale_state(env_dir, &pid_path)?;
-
-        // Start the sidecar
-        start_sidecar(env_dir, workspace_root, environment_name, &lock_file, &pid_path).await?;
+        // We got exclusive lock — no other clients.
+        if is_sidecar_alive(&pid_path) {
+            // Sidecar is alive in its grace period. Reuse it.
+            tracing::debug!("sidecar alive in grace period, reusing");
+        } else {
+            // No sidecar running. Clean up stale state and start fresh.
+            cleanup_stale_state(env_dir, &pid_path)?;
+            start_sidecar(env_dir, workspace_root, environment_name, &lock_file, &pid_path)
+                .await?;
+        }
 
         // Downgrade to shared lock
         let ret = unsafe { libc::flock(fd, libc::LOCK_SH) };
         if ret != 0 {
-            return Err(miette!("failed to downgrade to shared lock: {}", std::io::Error::last_os_error()));
+            return Err(miette!(
+                "failed to downgrade to shared lock: {}",
+                std::io::Error::last_os_error()
+            ));
         }
     } else {
         let err = std::io::Error::last_os_error();
@@ -145,7 +145,10 @@ pub async fn ensure_mount(
             // briefly while the sidecar initializes).
             let ret = unsafe { libc::flock(fd, libc::LOCK_SH) };
             if ret != 0 {
-                return Err(miette!("failed to acquire shared lock: {}", std::io::Error::last_os_error()));
+                return Err(miette!(
+                    "failed to acquire shared lock: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
 
             // Verify sidecar is alive
@@ -165,7 +168,6 @@ pub async fn ensure_mount(
     Ok(MountGuard {
         lock_file,
         lock_path,
-        pid_path,
     })
 }
 
@@ -184,7 +186,10 @@ async fn start_sidecar(
     // Create a pipe for readiness signaling
     let mut pipe_fds = [0i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-        return Err(miette!("failed to create pipe: {}", std::io::Error::last_os_error()));
+        return Err(miette!(
+            "failed to create pipe: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
 
@@ -196,25 +201,23 @@ async fn start_sidecar(
     let pid_path_str = pid_path.display().to_string();
 
     // Spawn the sidecar as a detached child process.
-    // We use Command::new rather than fork() for simplicity — the sidecar
-    // daemonizes itself internally.
     let mut cmd = std::process::Command::new(&pixi_exe);
     cmd.args([
-            "mount",
-            "--managed",
-            "-e",
-            environment_name,
-            "--mount-point",
-            &env_dir_str,
-            "--pidfile",
-            &pid_path_str,
-            "--ready-fd",
-            &write_fd_str,
-        ])
-        .current_dir(workspace_root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit());
+        "mount",
+        "--managed",
+        "-e",
+        environment_name,
+        "--mount-point",
+        &env_dir_str,
+        "--pidfile",
+        &pid_path_str,
+        "--ready-fd",
+        &write_fd_str,
+    ])
+    .current_dir(workspace_root)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::inherit());
 
     // Clear the CLOEXEC flag on write_fd so the child inherits it
     unsafe {
@@ -235,7 +238,9 @@ async fn start_sidecar(
     let mut child = cmd.spawn().into_diagnostic()?;
 
     // Close the write end in the parent
-    unsafe { libc::close(write_fd); }
+    unsafe {
+        libc::close(write_fd);
+    }
 
     // Wait for readiness signal from the sidecar
     let read_file = unsafe { File::from_raw_fd(read_fd) };
@@ -243,28 +248,22 @@ async fn start_sidecar(
     let mut line = String::new();
 
     // Use a timeout to avoid blocking forever if the sidecar fails
-    let readiness = tokio::task::spawn_blocking(move || {
-        reader.read_line(&mut line).map(|_| line)
-    });
+    let readiness = tokio::task::spawn_blocking(move || reader.read_line(&mut line).map(|_| line));
 
     match tokio::time::timeout(std::time::Duration::from_secs(30), readiness).await {
         Ok(Ok(Ok(msg))) if msg.starts_with("ready") => {
             tracing::debug!("mount sidecar is ready");
             Ok(())
         }
-        Ok(Ok(Ok(msg))) => {
-            Err(miette!("sidecar reported error: {}", msg.trim()))
-        }
-        Ok(Ok(Err(e))) => {
-            Err(miette!("failed to read from sidecar pipe: {e}"))
-        }
-        Ok(Err(e)) => {
-            Err(miette!("sidecar readiness task failed: {e}"))
-        }
+        Ok(Ok(Ok(msg))) => Err(miette!("sidecar reported error: {}", msg.trim())),
+        Ok(Ok(Err(e))) => Err(miette!("failed to read from sidecar pipe: {e}")),
+        Ok(Err(e)) => Err(miette!("sidecar readiness task failed: {e}")),
         Err(_) => {
             // Timeout — kill the child if still running
             let _ = child.kill();
-            Err(miette!("timed out waiting for mount sidecar to become ready"))
+            Err(miette!(
+                "timed out waiting for mount sidecar to become ready"
+            ))
         }
     }
 }
@@ -353,6 +352,14 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn test_coordination_paths() {
+        let mount_point = PathBuf::from("/tmp/envs/default");
+        let (lock_path, pid_path) = coordination_paths(&mount_point);
+        assert_eq!(lock_path, PathBuf::from("/tmp/envs/default.rattler-fs.lock"));
+        assert_eq!(pid_path, PathBuf::from("/tmp/envs/default.rattler-fs.pid"));
+    }
+
+    #[test]
     fn test_is_sidecar_alive_nonexistent_pid() {
         let tmp = TempDir::new().unwrap();
         let pid_path = tmp.path().join("test.pid");
@@ -402,7 +409,7 @@ mod tests {
         let env_dir = PathBuf::from("/tmp/test-env");
         assert_eq!(
             MountGuard::overlay_dir(&env_dir),
-            PathBuf::from("/tmp/test-env/.rattler-fs-overlay")
+            PathBuf::from("/tmp/test-env.rattler-fs-overlay")
         );
     }
 

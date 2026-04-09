@@ -518,6 +518,12 @@ pub struct ExperimentalConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_read_only: Option<bool>,
+
+    /// How long (in seconds) the mount sidecar stays alive after the last
+    /// client disconnects. Defaults to 120.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_grace_period: Option<u64>,
 }
 
 impl ExperimentalConfig {
@@ -531,6 +537,7 @@ impl ExperimentalConfig {
                 .or(self.environment_backend),
             mount_backend: other.mount_backend.or(self.mount_backend),
             mount_read_only: other.mount_read_only.or(self.mount_read_only),
+            mount_grace_period: other.mount_grace_period.or(self.mount_grace_period),
         }
     }
     pub fn use_environment_activation_cache(&self) -> bool {
@@ -542,6 +549,7 @@ impl ExperimentalConfig {
             && self.environment_backend.is_none()
             && self.mount_backend.is_none()
             && self.mount_read_only.is_none()
+            && self.mount_grace_period.is_none()
     }
 }
 
@@ -1449,6 +1457,7 @@ impl Config {
             "experimental",
             "experimental.environment-backend",
             "experimental.mount-backend",
+            "experimental.mount-grace-period",
             "experimental.mount-read-only",
             "experimental.use-environment-activation-cache",
             "mirrors",
@@ -1622,6 +1631,12 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .or(self.experimental.mount_read_only)
             .unwrap_or(false)
+    }
+
+    /// Grace period in seconds for the mount sidecar after the last client
+    /// disconnects. Defaults to 120 seconds.
+    pub fn mount_grace_period(&self) -> u64 {
+        self.experimental.mount_grace_period.unwrap_or(120)
     }
 
     /// Retrieve the value for the max_concurrent_solves field.
@@ -1921,6 +1936,10 @@ impl Config {
                     }
                     "mount-read-only" => {
                         self.experimental.mount_read_only =
+                            value.map(|v| v.parse()).transpose().into_diagnostic()?;
+                    }
+                    "mount-grace-period" => {
+                        self.experimental.mount_grace_period =
                             value.map(|v| v.parse()).transpose().into_diagnostic()?;
                     }
                     _ => return Err(err),
