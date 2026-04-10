@@ -111,6 +111,9 @@ insta = { workspace = true, features = ["filters"] }
 libc = { workspace = true, default-features = false }
 pixi_pty = { path = "../pixi_pty" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [features]
 default = []
 native-tls = [

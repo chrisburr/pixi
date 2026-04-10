@@ -48,9 +48,13 @@ pub struct Args {
     #[arg(long, hide = true)]
     pidfile: Option<PathBuf>,
 
-    /// File descriptor number for the readiness pipe (used with --managed).
+    /// File descriptor number for the readiness pipe (used with --managed, Unix only).
     #[arg(long, hide = true)]
     ready_fd: Option<i32>,
+
+    /// Named event for readiness signaling (used with --managed, Windows only).
+    #[arg(long, hide = true)]
+    ready_event: Option<String>,
 }
 
 pub async fn execute(args: Args) -> miette::Result<()> {
@@ -113,6 +117,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
             grace_period,
             args.pidfile.as_deref(),
             args.ready_fd,
+            args.ready_event.as_deref(),
         )
         .await
     } else {
@@ -205,7 +210,7 @@ async fn execute_interactive(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn execute_managed(
     lock_file: &rattler_lock::LockFile,
     environment_name: &str,
@@ -218,6 +223,7 @@ async fn execute_managed(
     grace_period: u64,
     pidfile: Option<&std::path::Path>,
     ready_fd: Option<i32>,
+    ready_event: Option<&str>,
 ) -> miette::Result<()> {
     std::fs::create_dir_all(mount_point).into_diagnostic()?;
 
@@ -246,7 +252,7 @@ async fn execute_managed(
         std::fs::write(pidfile, format!("{}\n", std::process::id())).into_diagnostic()?;
     }
 
-    // Signal readiness via pipe
+    // Signal readiness via pipe (Unix) or named event (Windows)
     #[cfg(unix)]
     if let Some(fd) = ready_fd {
         use std::os::unix::io::FromRawFd;
@@ -254,6 +260,27 @@ async fn execute_managed(
         use std::io::Write;
         let _ = pipe.write_all(b"ready\n");
         // pipe is dropped/closed here
+    }
+
+    #[cfg(windows)]
+    if let Some(event_name) = ready_event {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        let event_name_wide: Vec<u16> = OsStr::new(event_name)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            let handle = windows_sys::Win32::System::Threading::OpenEventW(
+                windows_sys::Win32::System::Threading::EVENT_MODIFY_STATE,
+                0,
+                event_name_wide.as_ptr(),
+            );
+            if !handle.is_null() {
+                windows_sys::Win32::System::Threading::SetEvent(handle);
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+        }
     }
 
     // Poll for client activity using the lock file. When no clients hold a
@@ -313,7 +340,61 @@ async fn execute_managed(
     }
 
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await.into_diagnostic()?;
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, UnlockFileEx,
+            LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+
+        let (lock_path, _) =
+            pixi_core::environment::mount_sidecar::coordination_paths(mount_point);
+
+        let probe_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&lock_path)
+            .into_diagnostic()?;
+        let probe_handle = probe_file.as_raw_handle();
+
+        let mut idle_seconds: u64 = 0;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
+                        unsafe { std::mem::zeroed() };
+                    let got_exclusive = unsafe {
+                        LockFileEx(
+                            probe_handle,
+                            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                            0,
+                            1,
+                            0,
+                            &mut overlapped,
+                        ) != 0
+                    };
+                    if got_exclusive {
+                        unsafe { UnlockFileEx(probe_handle, 0, 1, 0, &mut overlapped); }
+                        idle_seconds += 1;
+                        if idle_seconds >= grace_period {
+                            tracing::info!(
+                                "grace period expired ({grace_period}s), shutting down sidecar"
+                            );
+                            break;
+                        }
+                    } else {
+                        idle_seconds = 0;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::debug!("sidecar received Ctrl+C, shutting down");
+                    break;
+                }
+            }
+        }
+    }
 
     // Clean up pidfile
     if let Some(pidfile) = pidfile {

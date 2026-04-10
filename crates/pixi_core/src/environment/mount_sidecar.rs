@@ -27,12 +27,14 @@
 //! 3. When idle >= grace period → unmount and exit
 
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
 
 use miette::{IntoDiagnostic, miette};
 
@@ -83,12 +85,37 @@ impl MountGuard {
     }
 }
 
+// ─── Unix implementation ────────────────────────────────────────────────────
+
+/// Check if the sidecar process is still alive.
 #[cfg(unix)]
-impl Drop for MountGuard {
-    fn drop(&mut self) {
-        // The shared lock is released when lock_file is dropped.
-        // The sidecar manages its own lifetime via its polling loop.
-    }
+pub fn is_sidecar_alive(pid_path: &Path) -> bool {
+    let Ok(pid_str) = fs::read_to_string(pid_path) else {
+        return false;
+    };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+        return false;
+    };
+    // kill(pid, 0) checks if process exists without sending a signal
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Check if a path is a mount point.
+#[cfg(unix)]
+fn is_mountpoint(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    // A path is a mount point if its device ID differs from its parent's
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(parent_meta) = fs::metadata(parent) else {
+        return false;
+    };
+    meta.dev() != parent_meta.dev()
 }
 
 /// Ensure a mount is running for the given environment directory.
@@ -126,8 +153,7 @@ pub async fn ensure_mount(
         } else {
             // No sidecar running. Clean up stale state and start fresh.
             cleanup_stale_state(env_dir, &pid_path)?;
-            start_sidecar(env_dir, workspace_root, environment_name, &lock_file, &pid_path)
-                .await?;
+            start_sidecar(env_dir, workspace_root, environment_name, &lock_file, &pid_path).await?;
         }
 
         // Downgrade to shared lock
@@ -268,18 +294,255 @@ async fn start_sidecar(
     }
 }
 
+// ─── Windows implementation ─────────────────────────────────────────────────
+
 /// Check if the sidecar process is still alive.
-#[cfg(unix)]
+#[cfg(windows)]
 pub fn is_sidecar_alive(pid_path: &Path) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let Ok(pid_str) = fs::read_to_string(pid_path) else {
         return false;
     };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+    let Ok(pid) = pid_str.trim().parse::<u32>() else {
         return false;
     };
-    // kill(pid, 0) checks if process exists without sending a signal
-    unsafe { libc::kill(pid, 0) == 0 }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let alive = GetExitCodeProcess(handle, &mut exit_code) != 0
+            && exit_code == STILL_ACTIVE as u32;
+        CloseHandle(handle);
+        alive
+    }
 }
+
+/// Check if a path is an active ProjFS virtualization root.
+///
+/// ProjFS doesn't create mount points. Instead we check if the sidecar PID
+/// file exists and the sidecar is alive.
+#[cfg(windows)]
+fn is_mountpoint(path: &Path) -> bool {
+    let (_, pid_path) = coordination_paths(path);
+    is_sidecar_alive(&pid_path)
+}
+
+/// Ensure a mount is running for the given environment directory (Windows).
+///
+/// Uses `LockFileEx` for coordination instead of `flock`.
+#[cfg(windows)]
+pub async fn ensure_mount(
+    env_dir: &Path,
+    workspace_root: &Path,
+    environment_name: &str,
+) -> miette::Result<MountGuard> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, UnlockFileEx,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+
+    fs::create_dir_all(env_dir).into_diagnostic()?;
+
+    let (lock_path, pid_path) = coordination_paths(env_dir);
+
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(false)
+        .open(&lock_path)
+        .into_diagnostic()?;
+
+    let handle = lock_file.as_raw_handle();
+    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+
+    // Try exclusive lock (non-blocking)
+    let got_exclusive = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        ) != 0
+    };
+
+    if got_exclusive {
+        // We got exclusive lock — no other clients.
+        if is_sidecar_alive(&pid_path) {
+            tracing::debug!("sidecar alive in grace period, reusing");
+        } else {
+            cleanup_stale_state(env_dir, &pid_path)?;
+            start_sidecar(env_dir, workspace_root, environment_name, &lock_file, &pid_path).await?;
+        }
+
+        // Release exclusive lock, then acquire shared lock
+        unsafe {
+            overlapped = std::mem::zeroed();
+            UnlockFileEx(handle, 0, 1, 0, &mut overlapped);
+            // Acquire shared (non-exclusive) lock — blocking
+            overlapped = std::mem::zeroed();
+            if LockFileEx(handle, 0, 0, 1, 0, &mut overlapped) == 0 {
+                return Err(miette!(
+                    "failed to acquire shared lock: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            // Mount is starting or running. Acquire shared lock (blocking).
+            unsafe {
+                if LockFileEx(handle, 0, 0, 1, 0, &mut overlapped) == 0 {
+                    return Err(miette!(
+                        "failed to acquire shared lock: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+
+            // Verify sidecar is alive
+            if !is_sidecar_alive(&pid_path) {
+                unsafe {
+                    overlapped = std::mem::zeroed();
+                    UnlockFileEx(handle, 0, 1, 0, &mut overlapped);
+                }
+                drop(lock_file);
+                cleanup_stale_state(env_dir, &pid_path)?;
+                return Box::pin(ensure_mount(env_dir, workspace_root, environment_name)).await;
+            }
+        } else {
+            return Err(miette!("failed to acquire lock: {err}"));
+        }
+    }
+
+    Ok(MountGuard {
+        lock_file,
+        lock_path,
+    })
+}
+
+/// Start the sidecar mount process (Windows).
+///
+/// Uses a named event for readiness signaling instead of a pipe/fd.
+#[cfg(windows)]
+async fn start_sidecar(
+    env_dir: &Path,
+    workspace_root: &Path,
+    environment_name: &str,
+    _lock_file: &File,
+    pid_path: &Path,
+) -> miette::Result<()> {
+    // Use a unique named event for readiness signaling.
+    // Include a hash of env_dir to prevent collisions when multiple
+    // environments are mounted concurrently or PIDs are recycled.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    env_dir.hash(&mut hasher);
+    let event_name = format!(
+        "Local\\pixi-mount-ready-{}-{:x}",
+        std::process::id(),
+        hasher.finish()
+    );
+
+    // Create a named event
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    let event_name_wide: Vec<u16> = OsStr::new(&event_name)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    let event_handle = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            std::ptr::null(),
+            1, // manual reset
+            0, // initial state: not signaled
+            event_name_wide.as_ptr(),
+        )
+    };
+    if event_handle.is_null() {
+        return Err(miette!(
+            "failed to create readiness event: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let pixi_exe = std::env::current_exe().into_diagnostic()?;
+    let env_dir_str = env_dir.display().to_string();
+    let pid_path_str = pid_path.display().to_string();
+
+    let mut cmd = std::process::Command::new(&pixi_exe);
+    cmd.args([
+        "mount",
+        "--managed",
+        "-e",
+        environment_name,
+        "--mount-point",
+        &env_dir_str,
+        "--pidfile",
+        &pid_path_str,
+        "--ready-event",
+        &event_name,
+    ])
+    .current_dir(workspace_root)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::inherit());
+
+    let mut child = cmd.spawn().into_diagnostic()?;
+
+    // Wait for readiness event with timeout.
+    // Cast to isize for Send safety — Windows HANDLEs are just kernel object
+    // pointers and are safe to use from any thread.
+    let event_handle_isize = event_handle as isize;
+    let wait_result = tokio::task::spawn_blocking(move || unsafe {
+        let h = event_handle_isize as windows_sys::Win32::Foundation::HANDLE;
+        let result = windows_sys::Win32::System::Threading::WaitForSingleObject(h, 30_000);
+        windows_sys::Win32::Foundation::CloseHandle(h);
+        result
+    })
+    .await
+    .into_diagnostic()?;
+
+    use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+    match wait_result {
+        WAIT_OBJECT_0 => {
+            tracing::debug!("mount sidecar is ready");
+            Ok(())
+        }
+        WAIT_TIMEOUT => {
+            let _ = child.kill();
+            Err(miette!(
+                "timed out waiting for mount sidecar to become ready"
+            ))
+        }
+        WAIT_ABANDONED => {
+            let _ = child.kill();
+            Err(miette!(
+                "sidecar readiness event was abandoned (sidecar may have crashed)"
+            ))
+        }
+        other => {
+            let _ = child.kill();
+            Err(miette!(
+                "WaitForSingleObject returned unexpected status: 0x{:08x}",
+                other
+            ))
+        }
+    }
+}
+
+// ─── Platform-independent code ──────────────────────────────────────────────
 
 /// Clean up stale state from a previous (crashed) sidecar.
 fn cleanup_stale_state(env_dir: &Path, pid_path: &Path) -> miette::Result<()> {
@@ -299,30 +562,11 @@ fn cleanup_stale_state(env_dir: &Path, pid_path: &Path) -> miette::Result<()> {
     Ok(())
 }
 
-/// Check if a path is a mount point.
-#[cfg(unix)]
-fn is_mountpoint(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    // A path is a mount point if its device ID differs from its parent's
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    let Ok(parent_meta) = fs::metadata(parent) else {
-        return false;
-    };
-    meta.dev() != parent_meta.dev()
-}
-
 /// Force unmount a mount point.
 pub fn force_unmount(mount_point: &Path) -> miette::Result<()> {
-    let mnt = mount_point.display().to_string();
-
     #[cfg(target_os = "macos")]
     {
+        let mnt = mount_point.display().to_string();
         let _ = std::process::Command::new("umount")
             .args(["-f", &mnt])
             .status();
@@ -330,9 +574,34 @@ pub fn force_unmount(mount_point: &Path) -> miette::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        let mnt = mount_point.display().to_string();
         let _ = std::process::Command::new("fusermount3")
             .args(["-uz", &mnt])
             .status();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // ProjFS virtualization is stopped when the sidecar process exits.
+        // Terminate the sidecar if it's still running, then clean up.
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+
+        let (_, pid_path) = coordination_paths(mount_point);
+        if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                unsafe {
+                    let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                    if !handle.is_null() {
+                        TerminateProcess(handle, 1);
+                        CloseHandle(handle);
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(pid_path);
     }
 
     Ok(())
@@ -342,9 +611,6 @@ pub fn force_unmount(mount_point: &Path) -> miette::Result<()> {
 pub fn is_mounted(env_dir: &Path) -> bool {
     is_mountpoint(env_dir)
 }
-
-#[cfg(unix)]
-use std::os::unix::io::FromRawFd;
 
 #[cfg(test)]
 mod tests {
@@ -413,6 +679,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_mountpoint_regular_dir() {
         let tmp = TempDir::new().unwrap();

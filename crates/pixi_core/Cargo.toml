@@ -110,6 +110,9 @@ xxhash-rust = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 insta = { workspace = true, features = ["yaml", "glob", "filters"] }
 pixi_build_backend_passthrough = { workspace = true }
