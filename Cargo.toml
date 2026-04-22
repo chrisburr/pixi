@@ -262,6 +262,7 @@ file_url = { path = "/Users/cburr/Development/rattler/crates/file_url" }
 path_resolver = { path = "/Users/cburr/Development/rattler/crates/path_resolver" }
 rattler = { path = "/Users/cburr/Development/rattler/crates/rattler" }
 rattler_cache = { path = "/Users/cburr/Development/rattler/crates/rattler_cache" }
+rattler_config = { path = "/Users/cburr/Development/rattler/crates/rattler_config" }
 rattler_conda_types = { path = "/Users/cburr/Development/rattler/crates/rattler_conda_types" }
 rattler_digest = { path = "/Users/cburr/Development/rattler/crates/rattler_digest" }
 rattler_fs = { path = "/Users/cburr/Development/rattler/crates/rattler_fs" }
