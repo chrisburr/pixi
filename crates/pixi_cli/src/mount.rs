@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use miette::IntoDiagnostic;
@@ -8,9 +8,13 @@ use pixi_core::{
     environment::get_update_lock_file_and_prefix,
     lock_file::{ReinstallPackages, UpdateMode},
 };
-use rattler::package_cache::PackageCache;
+use rattler::{install::PythonInfo, package_cache::PackageCache};
 use rattler_conda_types::Platform;
-use rattler_lock::DEFAULT_ENVIRONMENT_NAME;
+use rattler_fs::{
+    Layout, VirtualFile,
+    package_source::{CondaPackage, PackageSource},
+};
+use rattler_lock::{DEFAULT_ENVIRONMENT_NAME, LockFile};
 
 use crate::cli_config::{LockAndInstallConfig, WorkspaceConfig};
 
@@ -100,8 +104,15 @@ pub async fn execute(args: Args) -> miette::Result<()> {
                 .join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR),
         );
 
-        let env_hash = rattler_fs::compute_env_hash(&lock_file, env_name, platform)
-            .map_err(|e| miette::miette!("failed to compute env hash: {e}"))?;
+        let environment = lock_file
+            .environment(env_name)
+            .ok_or_else(|| miette::miette!("environment '{env_name}' not found in lock file"))?;
+        let lock_platform = lock_file
+            .platform(&platform.to_string())
+            .ok_or_else(|| miette::miette!("platform '{platform}' not found in lock file"))?;
+        let env_hash = environment
+            .content_hash(lock_platform)
+            .ok_or_else(|| miette::miette!("platform '{platform}' not in environment '{env_name}'"))?;
 
         let grace_period = workspace.config().mount_grace_period();
 
@@ -136,9 +147,17 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         )
         .await?;
 
-        let env_hash =
-            rattler_fs::compute_env_hash(&lock_file_data.lock_file, env_name, platform)
-                .map_err(|e| miette::miette!("failed to compute env hash: {e}"))?;
+        let environment = lock_file_data
+            .lock_file
+            .environment(env_name)
+            .ok_or_else(|| miette::miette!("environment '{env_name}' not found in lock file"))?;
+        let lock_platform = lock_file_data
+            .lock_file
+            .platform(&platform.to_string())
+            .ok_or_else(|| miette::miette!("platform '{platform}' not found in lock file"))?;
+        let env_hash = environment
+            .content_hash(lock_platform)
+            .ok_or_else(|| miette::miette!("platform '{platform}' not in environment '{env_name}'"))?;
 
         execute_interactive(
             &lock_file_data.lock_file,
@@ -182,10 +201,13 @@ async fn execute_interactive(
         )
     };
 
-    let _handle =
-        rattler_fs::build_and_mount(lock_file, environment_name, platform, package_cache, &config)
-            .await
-            .map_err(|e| miette::miette!("failed to mount: {e}"))?;
+    let layout = build_layout(lock_file, environment_name, platform, package_cache, env_hash)
+        .await
+        .map_err(|e| miette::miette!("failed to prepare mount layout: {e}"))?;
+
+    let _handle = rattler_fs::build_and_mount(&layout, &config)
+        .await
+        .map_err(|e| miette::miette!("failed to mount: {e}"))?;
 
     eprintln!(
         "Mounted at {}. Press Ctrl+C to unmount.",
@@ -242,10 +264,13 @@ async fn execute_managed(
         )
     };
 
-    let _handle =
-        rattler_fs::build_and_mount(lock_file, environment_name, platform, package_cache, &config)
-            .await
-            .map_err(|e| miette::miette!("failed to mount: {e}"))?;
+    let layout = build_layout(lock_file, environment_name, platform, package_cache, env_hash)
+        .await
+        .map_err(|e| miette::miette!("failed to prepare mount layout: {e}"))?;
+
+    let _handle = rattler_fs::build_and_mount(&layout, &config)
+        .await
+        .map_err(|e| miette::miette!("failed to mount: {e}"))?;
 
     // Write PID file
     if let Some(pidfile) = pidfile {
@@ -403,4 +428,111 @@ async fn execute_managed(
 
     // _handle drops here, triggering unmount
     Ok(())
+}
+
+/// Build the [`Layout`] required by the new `rattler_fs` entry points:
+/// fetch every conda package in the lock file (warm cache on repeat mounts),
+/// wrap each extracted directory in a [`CondaPackage`] source, and inject a
+/// single virtual file carrying the env-hash so consumers can detect stale
+/// caches without writing to the (possibly read-only) mount.
+async fn build_layout(
+    lock_file: &LockFile,
+    environment_name: &str,
+    platform: Platform,
+    package_cache: &PackageCache,
+    env_hash: &str,
+) -> anyhow::Result<Layout> {
+    let environment = lock_file
+        .environment(environment_name)
+        .ok_or_else(|| anyhow::anyhow!("environment '{environment_name}' not found"))?;
+    let lock_platform = lock_file
+        .platform(&platform.to_string())
+        .ok_or_else(|| anyhow::anyhow!("platform '{platform}' not found"))?;
+    let package_refs: Vec<_> = environment
+        .packages(lock_platform)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no packages for platform {platform} in environment '{environment_name}'"
+            )
+        })?
+        .collect();
+
+    let python_info = package_refs
+        .iter()
+        .filter_map(|p| p.as_binary_conda())
+        .find(|p| p.package_record.name.as_normalized() == "python")
+        .map(|p| PythonInfo::from_python_record(&p.package_record, platform))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("failed to get python info: {e}"))?;
+
+    let mut conda_packages: Vec<_> = package_refs
+        .iter()
+        .filter_map(|p| p.as_binary_conda())
+        .collect();
+
+    // Largest first so long downloads start early.
+    conda_packages.sort_by(|a, b| {
+        b.package_record
+            .size
+            .unwrap_or(0)
+            .cmp(&a.package_record.size.unwrap_or(0))
+    });
+
+    let client = rattler_networking::LazyClient::new(
+        reqwest_middleware::ClientWithMiddleware::default,
+    );
+    let concurrency = Arc::new(tokio::sync::Semaphore::new(16));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for package_data in &conda_packages {
+        let cache = package_cache.clone();
+        let client = client.clone();
+        let record = package_data.package_record.clone();
+        let location = package_data.location.clone();
+        let is_noarch_python = package_data.package_record.noarch.is_python();
+        let name = record.name.as_normalized().to_string();
+        let py = python_info.clone();
+        let sem = concurrency.clone();
+
+        join_set.spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
+            let url = location
+                .as_url()
+                .ok_or_else(|| anyhow::anyhow!("package has no URL"))?
+                .clone();
+            let cache_metadata = cache
+                .get_or_fetch_from_url_with_retry(
+                    &record,
+                    url,
+                    client,
+                    rattler_networking::retry_policies::default_retry_policy(),
+                    None,
+                )
+                .await?;
+
+            let extracted_path = cache_metadata.path().to_path_buf();
+            let python_for_pkg = if is_noarch_python { py } else { None };
+            let pkg: Box<dyn PackageSource> = Box::new(CondaPackage::from_extracted(
+                name,
+                &extracted_path,
+                python_for_pkg,
+            )?);
+            Ok::<_, anyhow::Error>(pkg)
+        });
+    }
+
+    let mut packages: Vec<Box<dyn PackageSource>> = Vec::with_capacity(conda_packages.len());
+    while let Some(result) = join_set.join_next().await {
+        packages.push(result.map_err(|e| anyhow::anyhow!("fetch task failed: {e}"))??);
+    }
+
+    Ok(Layout::new()
+        .with_packages(packages)
+        .with_virtual_files(vec![VirtualFile::new(
+            "conda-meta/rattler-fs_env",
+            env_hash.as_bytes().to_vec(),
+        )]))
 }
