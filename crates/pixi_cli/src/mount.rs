@@ -107,11 +107,8 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         let environment = lock_file
             .environment(env_name)
             .ok_or_else(|| miette::miette!("environment '{env_name}' not found in lock file"))?;
-        let lock_platform = lock_file
-            .platform(&platform.to_string())
-            .ok_or_else(|| miette::miette!("platform '{platform}' not found in lock file"))?;
         let env_hash = environment
-            .content_hash(lock_platform)
+            .content_hash(platform)
             .ok_or_else(|| miette::miette!("platform '{platform}' not in environment '{env_name}'"))?;
 
         let grace_period = workspace.config().mount_grace_period();
@@ -151,12 +148,8 @@ pub async fn execute(args: Args) -> miette::Result<()> {
             .lock_file
             .environment(env_name)
             .ok_or_else(|| miette::miette!("environment '{env_name}' not found in lock file"))?;
-        let lock_platform = lock_file_data
-            .lock_file
-            .platform(&platform.to_string())
-            .ok_or_else(|| miette::miette!("platform '{platform}' not found in lock file"))?;
         let env_hash = environment
-            .content_hash(lock_platform)
+            .content_hash(platform)
             .ok_or_else(|| miette::miette!("platform '{platform}' not in environment '{env_name}'"))?;
 
         execute_interactive(
@@ -441,17 +434,14 @@ async fn build_layout(
     platform: Platform,
     package_cache: &PackageCache,
     env_hash: &str,
-) -> anyhow::Result<Layout> {
+) -> miette::Result<Layout> {
     let environment = lock_file
         .environment(environment_name)
-        .ok_or_else(|| anyhow::anyhow!("environment '{environment_name}' not found"))?;
-    let lock_platform = lock_file
-        .platform(&platform.to_string())
-        .ok_or_else(|| anyhow::anyhow!("platform '{platform}' not found"))?;
+        .ok_or_else(|| miette::miette!("environment '{environment_name}' not found"))?;
     let package_refs: Vec<_> = environment
-        .packages(lock_platform)
+        .packages(platform)
         .ok_or_else(|| {
-            anyhow::anyhow!(
+            miette::miette!(
                 "no packages for platform {platform} in environment '{environment_name}'"
             )
         })?
@@ -463,7 +453,7 @@ async fn build_layout(
         .find(|p| p.package_record.name.as_normalized() == "python")
         .map(|p| PythonInfo::from_python_record(&p.package_record, platform))
         .transpose()
-        .map_err(|e| anyhow::anyhow!("failed to get python info: {e}"))?;
+        .map_err(|e| miette::miette!("failed to get python info: {e}"))?;
 
     let mut conda_packages: Vec<_> = package_refs
         .iter()
@@ -498,10 +488,10 @@ async fn build_layout(
             let _permit = sem
                 .acquire()
                 .await
-                .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
+                .map_err(|e| miette::miette!("concurrency semaphore closed: {e}"))?;
             let url = location
                 .as_url()
-                .ok_or_else(|| anyhow::anyhow!("package has no URL"))?
+                .ok_or_else(|| miette::miette!("package has no URL"))?
                 .clone();
             let cache_metadata = cache
                 .get_or_fetch_from_url_with_retry(
@@ -511,22 +501,22 @@ async fn build_layout(
                     rattler_networking::retry_policies::default_retry_policy(),
                     None,
                 )
-                .await?;
+                .await
+                .map_err(|e| miette::miette!("failed to fetch package: {e}"))?;
 
             let extracted_path = cache_metadata.path().to_path_buf();
             let python_for_pkg = if is_noarch_python { py } else { None };
-            let pkg: Box<dyn PackageSource> = Box::new(CondaPackage::from_extracted(
-                name,
-                &extracted_path,
-                python_for_pkg,
-            )?);
-            Ok::<_, anyhow::Error>(pkg)
+            let pkg: Box<dyn PackageSource> = Box::new(
+                CondaPackage::from_extracted(name, &extracted_path, python_for_pkg)
+                    .map_err(|e| miette::miette!("failed to build CondaPackage: {e}"))?,
+            );
+            Ok::<_, miette::Report>(pkg)
         });
     }
 
     let mut packages: Vec<Box<dyn PackageSource>> = Vec::with_capacity(conda_packages.len());
     while let Some(result) = join_set.join_next().await {
-        packages.push(result.map_err(|e| anyhow::anyhow!("fetch task failed: {e}"))??);
+        packages.push(result.map_err(|e| miette::miette!("fetch task failed: {e}"))??);
     }
 
     Ok(Layout::new()
