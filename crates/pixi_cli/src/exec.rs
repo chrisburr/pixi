@@ -11,6 +11,7 @@ use pixi_utils::{AsyncPrefixGuard, EnvironmentHash, reqwest::build_reqwest_clien
 use rattler::{
     install::{IndicatifReporter, Installer},
     package_cache::PackageCache,
+    validation::ValidationMode,
 };
 use rattler_conda_types::{GenericVirtualPackage, MatchSpec, PackageName, Platform};
 use rattler_solve::{SolverImpl, SolverTask, resolvo::Solver};
@@ -68,7 +69,8 @@ pub struct Args {
 /// CLI entry point for `pixi exec`
 pub async fn execute(args: Args) -> miette::Result<()> {
     let config = Config::with_cli_config(&args.config);
-    let cache_dir = pixi_config::get_cache_dir().context("failed to determine cache directory")?;
+    let cache_dirs =
+        pixi_config::get_cache_dirs().context("failed to determine cache directory")?;
 
     let mut command_iter = args.command.iter();
     let command = command_iter.next().ok_or_else(|| miette::miette!(help ="i.e when specifying specs explicitly use a command at the end: `pixi exec -s python==3.12 python`", "missing required command to execute",))?;
@@ -98,7 +100,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
     let prefix = create_exec_prefix(
         &args,
         &install_specs,
-        &cache_dir,
+        &cache_dirs,
         &config,
         &client,
         should_guess_package,
@@ -163,11 +165,15 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 pub async fn create_exec_prefix(
     args: &Args,
     specs: &[MatchSpec],
-    cache_dir: &Path,
+    cache_dirs: &[std::path::PathBuf],
     config: &Config,
     client: &ClientWithMiddleware,
     has_guessed_package: bool,
 ) -> miette::Result<Prefix> {
+    let cache_dir: &Path = cache_dirs
+        .first()
+        .expect("cache_dirs must be non-empty")
+        .as_path();
     let command = args.command.first().expect("missing required command");
     let specs = specs.to_vec();
 
@@ -303,8 +309,12 @@ pub async fn create_exec_prefix(
                 .clear_when_done(true)
                 .finish(),
         )
-        .with_package_cache(PackageCache::new(
-            cache_dir.join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR),
+        .with_package_cache(PackageCache::new_layered(
+            cache_dirs
+                .iter()
+                .map(|p| p.join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR)),
+            false,
+            ValidationMode::default(),
         ))
         .install(prefix.root(), solved_records.records.clone())
         .await

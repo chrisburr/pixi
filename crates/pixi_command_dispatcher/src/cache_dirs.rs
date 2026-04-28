@@ -37,6 +37,12 @@ pub struct CacheDirs {
 
     /// The location where to store source builds.
     source_builds: Option<AbsPresumedDirPathBuf>,
+
+    /// Additional read-only fallback roots used to extend the package cache
+    /// into a layered cache. The package cache will look up entries in
+    /// [`Self::packages`] first, then in `<fallback>/pkgs` for each fallback
+    /// in order. Other caches ignore these.
+    package_fallbacks: Vec<AbsPresumedDirPathBuf>,
 }
 
 impl CacheDirs {
@@ -53,7 +59,19 @@ impl CacheDirs {
             url: None,
             source_metadata: None,
             source_builds: None,
+            package_fallbacks: Vec::new(),
         }
+    }
+
+    /// Adds read-only fallback roots that extend the package cache into a
+    /// layered cache. Each fallback contributes a `<root>/pkgs` layer that is
+    /// consulted (in order) after the primary package cache.
+    pub fn with_package_fallbacks(
+        mut self,
+        fallbacks: impl IntoIterator<Item = AbsPresumedDirPathBuf>,
+    ) -> Self {
+        self.package_fallbacks.extend(fallbacks);
+        self
     }
 
     pub fn with_workspace(self, workspace: AbsPresumedDirPathBuf) -> Self {
@@ -122,6 +140,19 @@ impl CacheDirs {
         self.packages
             .clone()
             .unwrap_or_else(|| self.root.join(consts::CACHED_PACKAGES).into_assume_dir())
+    }
+
+    /// Returns the package cache layers, in lookup order. The first entry is
+    /// the primary writable cache from [`Self::packages`]; subsequent entries
+    /// are derived from any fallback roots configured via
+    /// [`Self::with_package_fallbacks`].
+    pub fn packages_layered(&self) -> Vec<AbsPresumedDirPathBuf> {
+        let mut layers = Vec::with_capacity(1 + self.package_fallbacks.len());
+        layers.push(self.packages());
+        for fallback in &self.package_fallbacks {
+            layers.push(fallback.join(consts::CACHED_PACKAGES).into_assume_dir());
+        }
+        layers
     }
 
     /// Returns the directory where git repositories are cached.

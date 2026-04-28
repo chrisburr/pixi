@@ -16,6 +16,7 @@ use pixi_glob::GlobHashCache;
 use pixi_path::{AbsPathBuf, AbsPresumedDirPathBuf};
 use pixi_url::resolver::UrlResolver;
 use rattler::package_cache::PackageCache;
+use rattler::validation::ValidationMode;
 use rattler_conda_types::{GenericVirtualPackage, Platform};
 use rattler_networking::LazyClient;
 use rattler_repodata_gateway::{Gateway, MaxConcurrency};
@@ -157,7 +158,14 @@ impl CommandDispatcherBuilder {
             .cache_dirs
             .unwrap_or_else(|| CacheDirs::new(root_dir.join(".cache").into_assume_dir()));
         let download_client = self.download_client.unwrap_or_default();
-        let package_cache = PackageCache::new(cache_dirs.packages());
+        let package_cache = PackageCache::new_layered(
+            cache_dirs
+                .packages_layered()
+                .into_iter()
+                .map(|p| p.into_std_path_buf()),
+            false,
+            ValidationMode::default(),
+        );
         let gateway = self.gateway.unwrap_or_else(|| {
             Gateway::builder()
                 .with_client(download_client.clone())

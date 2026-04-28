@@ -135,25 +135,58 @@ pub fn pixi_home() -> Option<PathBuf> {
 
 // TODO(tim): I think we should move this to another crate, dont know if global
 // config is really correct
+/// Returns the default cache directories, in order of preference.
+///
+/// Both `PIXI_CACHE_DIR` and `RATTLER_CACHE_DIR` may contain a `PATH`-style
+/// list of directories (separated by `:` on Unix, `;` on Windows). The first
+/// entry is the primary (writable) cache; subsequent entries are read-only
+/// lookup layers used by the package cache. Only the package cache is layered;
+/// repodata and other caches use the primary entry only.
+///
+/// Resolution order:
+/// - `PIXI_CACHE_DIR` (split)
+/// - else `RATTLER_CACHE_DIR` (split)
+/// - else `XDG_CACHE_HOME/pixi` (single, if it exists)
+/// - else [`rattler::default_cache_dir`] (single)
+pub fn get_cache_dirs() -> miette::Result<Vec<PathBuf>> {
+    if let Some(value) = std::env::var_os("PIXI_CACHE_DIR") {
+        let dirs: Vec<PathBuf> = std::env::split_paths(&value)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        if !dirs.is_empty() {
+            return Ok(dirs);
+        }
+    }
+    if let Some(value) = std::env::var_os("RATTLER_CACHE_DIR") {
+        let dirs: Vec<PathBuf> = std::env::split_paths(&value)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        if !dirs.is_empty() {
+            return Ok(dirs);
+        }
+    }
+    if let Some(d) = dirs::cache_dir().map(|d| d.join(consts::PIXI_DIR))
+        && d.exists()
+    {
+        return Ok(vec![d]);
+    }
+    if let Ok(d) = rattler::default_cache_dir() {
+        return Ok(vec![d]);
+    }
+    Err(miette::miette!(
+        "could not determine default cache directory"
+    ))
+}
+
 /// Returns the default cache directory.
-/// Most important is the `PIXI_CACHE_DIR` environment variable.
-/// - If that is not set, the `RATTLER_CACHE_DIR` environment variable is used.
-/// - If that is not set, `XDG_CACHE_HOME/pixi` is used when the directory
-///   exists.
-/// - If that is not set, the default cache directory of
-///   [`rattler::default_cache_dir`] is used.
+///
+/// Returns the primary (first) entry from [`get_cache_dirs`]. Use
+/// [`get_cache_dirs`] when configuring a layered package cache.
 pub fn get_cache_dir() -> miette::Result<PathBuf> {
-    std::env::var("PIXI_CACHE_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("RATTLER_CACHE_DIR").map(PathBuf::from).ok())
-        .or_else(|| {
-            let pixi_cache_dir = dirs::cache_dir().map(|d| d.join(consts::PIXI_DIR));
-            // Only use the xdg cache pixi directory when it exists
-            pixi_cache_dir.and_then(|d| d.exists().then_some(d))
-        })
-        .or_else(|| rattler::default_cache_dir().ok())
-        .ok_or_else(|| miette::miette!("could not determine default cache directory"))
+    Ok(get_cache_dirs()?
+        .into_iter()
+        .next()
+        .expect("get_cache_dirs returns a non-empty Vec"))
 }
 #[derive(Parser, Debug, Default, Clone)]
 pub struct ConfigCli {
@@ -464,7 +497,9 @@ impl std::str::FromStr for EnvironmentBackend {
         match s {
             "link" => Ok(Self::Link),
             "mount" => Ok(Self::Mount),
-            _ => Err(format!("unknown environment backend: {s} (expected 'link' or 'mount')")),
+            _ => Err(format!(
+                "unknown environment backend: {s} (expected 'link' or 'mount')"
+            )),
         }
     }
 }
@@ -489,7 +524,9 @@ impl std::str::FromStr for MountBackend {
             "auto" => Ok(Self::Auto),
             "nfs" => Ok(Self::Nfs),
             "fuse" => Ok(Self::Fuse),
-            _ => Err(format!("unknown mount backend: {s} (expected 'auto', 'nfs', or 'fuse')")),
+            _ => Err(format!(
+                "unknown mount backend: {s} (expected 'auto', 'nfs', or 'fuse')"
+            )),
         }
     }
 }
@@ -532,9 +569,7 @@ impl ExperimentalConfig {
             use_environment_activation_cache: other
                 .use_environment_activation_cache
                 .or(self.use_environment_activation_cache),
-            environment_backend: other
-                .environment_backend
-                .or(self.environment_backend),
+            environment_backend: other.environment_backend.or(self.environment_backend),
             mount_backend: other.mount_backend.or(self.mount_backend),
             mount_read_only: other.mount_read_only.or(self.mount_read_only),
             mount_grace_period: other.mount_grace_period.or(self.mount_grace_period),
