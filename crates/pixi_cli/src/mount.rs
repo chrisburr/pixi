@@ -8,7 +8,11 @@ use pixi_core::{
     environment::get_update_lock_file_and_prefix,
     lock_file::{ReinstallPackages, UpdateMode},
 };
-use rattler::{install::PythonInfo, package_cache::PackageCache};
+use rattler::{
+    install::PythonInfo,
+    package_cache::PackageCache,
+    validation::ValidationMode,
+};
 use rattler_conda_types::Platform;
 use rattler_fs::{
     Layout, VirtualFile,
@@ -97,19 +101,24 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         // The managed sidecar is spawned by ensure_mount after the parent has
         // already solved and cached packages. Just load the existing lock file
         // and package cache — no solve needed.
-        let lock_file = rattler_lock::LockFile::from_path(&workspace.lock_file_path())
-            .into_diagnostic()?;
-        let package_cache = PackageCache::new(
-            pixi_config::get_cache_dir()?
-                .join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR),
+        let lock_file =
+            rattler_lock::LockFile::from_path(&workspace.lock_file_path()).into_diagnostic()?;
+        let package_cache = PackageCache::new_layered(
+            std::iter::once(
+                pixi_config::get_cache_dir()?
+                    .join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR),
+            )
+            .chain(pixi_config::get_pkg_cache_layers()),
+            false,
+            ValidationMode::default(),
         );
 
         let environment = lock_file
             .environment(env_name)
             .ok_or_else(|| miette::miette!("environment '{env_name}' not found in lock file"))?;
-        let env_hash = environment
-            .content_hash(platform)
-            .ok_or_else(|| miette::miette!("platform '{platform}' not in environment '{env_name}'"))?;
+        let env_hash = environment.content_hash(platform).ok_or_else(|| {
+            miette::miette!("platform '{platform}' not in environment '{env_name}'")
+        })?;
 
         let grace_period = workspace.config().mount_grace_period();
 
@@ -148,9 +157,9 @@ pub async fn execute(args: Args) -> miette::Result<()> {
             .lock_file
             .environment(env_name)
             .ok_or_else(|| miette::miette!("environment '{env_name}' not found in lock file"))?;
-        let env_hash = environment
-            .content_hash(platform)
-            .ok_or_else(|| miette::miette!("platform '{platform}' not in environment '{env_name}'"))?;
+        let env_hash = environment.content_hash(platform).ok_or_else(|| {
+            miette::miette!("platform '{platform}' not in environment '{env_name}'")
+        })?;
 
         execute_interactive(
             &lock_file_data.lock_file,
@@ -194,9 +203,15 @@ async fn execute_interactive(
         )
     };
 
-    let layout = build_layout(lock_file, environment_name, platform, package_cache, env_hash)
-        .await
-        .map_err(|e| miette::miette!("failed to prepare mount layout: {e}"))?;
+    let layout = build_layout(
+        lock_file,
+        environment_name,
+        platform,
+        package_cache,
+        env_hash,
+    )
+    .await
+    .map_err(|e| miette::miette!("failed to prepare mount layout: {e}"))?;
 
     let _handle = rattler_fs::build_and_mount(&layout, &config)
         .await
@@ -210,9 +225,8 @@ async fn execute_interactive(
     // Wait for Ctrl+C or SIGTERM
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .into_diagnostic()?;
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .into_diagnostic()?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = sigterm.recv() => {},
@@ -257,9 +271,15 @@ async fn execute_managed(
         )
     };
 
-    let layout = build_layout(lock_file, environment_name, platform, package_cache, env_hash)
-        .await
-        .map_err(|e| miette::miette!("failed to prepare mount layout: {e}"))?;
+    let layout = build_layout(
+        lock_file,
+        environment_name,
+        platform,
+        package_cache,
+        env_hash,
+    )
+    .await
+    .map_err(|e| miette::miette!("failed to prepare mount layout: {e}"))?;
 
     let _handle = rattler_fs::build_and_mount(&layout, &config)
         .await
@@ -307,12 +327,10 @@ async fn execute_managed(
     {
         use std::os::unix::io::AsRawFd;
 
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .into_diagnostic()?;
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .into_diagnostic()?;
 
-        let (lock_path, _) =
-            pixi_core::environment::mount_sidecar::coordination_paths(mount_point);
+        let (lock_path, _) = pixi_core::environment::mount_sidecar::coordination_paths(mount_point);
 
         let probe_file = std::fs::OpenOptions::new()
             .read(true)
@@ -361,12 +379,10 @@ async fn execute_managed(
     {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
-            LockFileEx, UnlockFileEx,
-            LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+            LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
         };
 
-        let (lock_path, _) =
-            pixi_core::environment::mount_sidecar::coordination_paths(mount_point);
+        let (lock_path, _) = pixi_core::environment::mount_sidecar::coordination_paths(mount_point);
 
         let probe_file = std::fs::OpenOptions::new()
             .read(true)
@@ -468,9 +484,8 @@ async fn build_layout(
             .cmp(&a.package_record.size.unwrap_or(0))
     });
 
-    let client = rattler_networking::LazyClient::new(
-        reqwest_middleware::ClientWithMiddleware::default,
-    );
+    let client =
+        rattler_networking::LazyClient::new(reqwest_middleware::ClientWithMiddleware::default);
     let concurrency = Arc::new(tokio::sync::Semaphore::new(16));
     let mut join_set = tokio::task::JoinSet::new();
 
