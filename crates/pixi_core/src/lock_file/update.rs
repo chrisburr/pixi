@@ -507,8 +507,7 @@ pub struct LockFileDerivedData<'p> {
     /// Active mount guards for environments using the "mount" backend.
     /// Kept alive so the shared flock persists until this struct is dropped.
     #[cfg(unix)]
-    pub mount_guards:
-        DashMap<EnvironmentName, crate::environment::mount_sidecar::MountGuard>,
+    pub mount_guards: DashMap<EnvironmentName, crate::environment::mount_sidecar::MountGuard>,
 }
 
 /// The mode to use when updating a prefix.
@@ -583,6 +582,18 @@ impl<'p> LockFileDerivedData<'p> {
             if self.workspace.config().environment_backend()
                 == pixi_config::EnvironmentBackend::Mount
             {
+                // Pre-fetch packages in the parent so the sidecar's startup
+                // is a warm-cache lookup, not a fetch + extract storm under
+                // a 30s readiness timeout.
+                crate::environment::mount_sidecar::prefetch_packages_for_mount(
+                    &self.lock_file,
+                    environment.name().as_str(),
+                    environment.best_platform(),
+                    &self.package_cache,
+                    self.workspace.authenticated_client()?.clone(),
+                )
+                .await?;
+
                 let env_dir = environment.dir();
                 let guard = crate::environment::mount_sidecar::ensure_mount(
                     &env_dir,
@@ -590,8 +601,7 @@ impl<'p> LockFileDerivedData<'p> {
                     environment.name().as_str(),
                 )
                 .await?;
-                self.mount_guards
-                    .insert(environment.name().clone(), guard);
+                self.mount_guards.insert(environment.name().clone(), guard);
             }
             return prefix;
         }
@@ -706,6 +716,18 @@ impl<'p> LockFileDerivedData<'p> {
                 if self.workspace.config().environment_backend()
                     == pixi_config::EnvironmentBackend::Mount
                 {
+                    // Pre-fetch packages in the parent so the sidecar's
+                    // startup is a warm-cache lookup, not a fetch + extract
+                    // storm under a 30s readiness timeout.
+                    crate::environment::mount_sidecar::prefetch_packages_for_mount(
+                        &self.lock_file,
+                        environment.name().as_str(),
+                        environment.best_platform(),
+                        &self.package_cache,
+                        self.workspace.authenticated_client()?.clone(),
+                    )
+                    .await?;
+
                     let env_dir = environment.dir();
                     let guard = crate::environment::mount_sidecar::ensure_mount(
                         &env_dir,
@@ -715,8 +737,7 @@ impl<'p> LockFileDerivedData<'p> {
                     .await?;
 
                     // Store the guard so it lives as long as this LockFileDerivedData
-                    self.mount_guards
-                        .insert(environment.name().clone(), guard);
+                    self.mount_guards.insert(environment.name().clone(), guard);
 
                     tracing::info!(
                         "environment '{}' mounted at {}",

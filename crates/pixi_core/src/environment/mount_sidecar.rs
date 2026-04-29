@@ -85,6 +85,98 @@ impl MountGuard {
     }
 }
 
+// ─── Parent-side prefetch ───────────────────────────────────────────────────
+
+/// Pre-fetch every conda package referenced by `lock_file` for `platform`
+/// into `package_cache`, so the mount sidecar's `build_layout` becomes a
+/// warm-cache lookup loop and starts within seconds even on cold caches.
+///
+/// The fetch loop mirrors the one in `pixi_cli::mount::build_layout`, but
+/// runs in the parent process so progress (and any I/O delay from CVMFS
+/// warming up or large downloads) is visible to the user instead of
+/// invisibly tripping the sidecar readiness timeout.
+///
+/// `client` is converted into a `LazyClient` internally and reused across
+/// all fetch tasks. Returns once every package is available in the cache.
+pub async fn prefetch_packages_for_mount(
+    lock_file: &rattler_lock::LockFile,
+    environment_name: &str,
+    platform: rattler_conda_types::Platform,
+    package_cache: &rattler::package_cache::PackageCache,
+    client: impl Into<rattler_networking::LazyClient>,
+) -> miette::Result<()> {
+    use std::sync::Arc;
+
+    let environment = lock_file
+        .environment(environment_name)
+        .ok_or_else(|| miette!("environment '{environment_name}' not found in lock file"))?;
+    let Some(packages) = environment.packages(platform) else {
+        return Ok(());
+    };
+
+    let mut conda_packages: Vec<_> = packages.filter_map(|p| p.as_binary_conda()).collect();
+    if conda_packages.is_empty() {
+        return Ok(());
+    }
+
+    // Largest first so long downloads start early.
+    conda_packages.sort_by(|a, b| {
+        b.package_record
+            .size
+            .unwrap_or(0)
+            .cmp(&a.package_record.size.unwrap_or(0))
+    });
+
+    let total = conda_packages.len();
+    tracing::info!(
+        "prefetching {total} package(s) for mount of environment '{environment_name}'"
+    );
+
+    let lazy_client: rattler_networking::LazyClient = client.into();
+    let concurrency = Arc::new(tokio::sync::Semaphore::new(16));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for package_data in &conda_packages {
+        let cache = package_cache.clone();
+        let client = lazy_client.clone();
+        let record = package_data.package_record.clone();
+        let location = package_data.location.clone();
+        let sem = concurrency.clone();
+
+        join_set.spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|e| miette!("concurrency semaphore closed: {e}"))?;
+            let url = location
+                .as_url()
+                .ok_or_else(|| miette!("package has no URL"))?
+                .clone();
+            cache
+                .get_or_fetch_from_url_with_retry(
+                    &record,
+                    url,
+                    client,
+                    rattler_networking::retry_policies::default_retry_policy(),
+                    None,
+                )
+                .await
+                .map_err(|e| miette!("failed to prefetch package: {e}"))?;
+            Ok::<_, miette::Report>(())
+        });
+    }
+
+    let mut completed = 0usize;
+    while let Some(result) = join_set.join_next().await {
+        result.map_err(|e| miette!("prefetch task failed: {e}"))??;
+        completed += 1;
+        tracing::debug!("prefetch progress: {completed}/{total}");
+    }
+
+    tracing::info!("prefetch complete ({total} package(s))");
+    Ok(())
+}
+
 // ─── Unix implementation ────────────────────────────────────────────────────
 
 /// Check if the sidecar process is still alive.
@@ -153,7 +245,14 @@ pub async fn ensure_mount(
         } else {
             // No sidecar running. Clean up stale state and start fresh.
             cleanup_stale_state(env_dir, &pid_path)?;
-            start_sidecar(env_dir, workspace_root, environment_name, &lock_file, &pid_path).await?;
+            start_sidecar(
+                env_dir,
+                workspace_root,
+                environment_name,
+                &lock_file,
+                &pid_path,
+            )
+            .await?;
         }
 
         // Downgrade to shared lock
@@ -300,7 +399,9 @@ async fn start_sidecar(
 #[cfg(windows)]
 pub fn is_sidecar_alive(pid_path: &Path) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     let Ok(pid_str) = fs::read_to_string(pid_path) else {
         return false;
     };
@@ -314,8 +415,8 @@ pub fn is_sidecar_alive(pid_path: &Path) -> bool {
             return false;
         }
         let mut exit_code: u32 = 0;
-        let alive = GetExitCodeProcess(handle, &mut exit_code) != 0
-            && exit_code == STILL_ACTIVE as u32;
+        let alive =
+            GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE as u32;
         CloseHandle(handle);
         alive
     }
@@ -343,8 +444,7 @@ pub async fn ensure_mount(
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, UnlockFileEx,
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
     };
 
     fs::create_dir_all(env_dir).into_diagnostic()?;
@@ -380,7 +480,14 @@ pub async fn ensure_mount(
             tracing::debug!("sidecar alive in grace period, reusing");
         } else {
             cleanup_stale_state(env_dir, &pid_path)?;
-            start_sidecar(env_dir, workspace_root, environment_name, &lock_file, &pid_path).await?;
+            start_sidecar(
+                env_dir,
+                workspace_root,
+                environment_name,
+                &lock_file,
+                &pid_path,
+            )
+            .await?;
         }
 
         // Release exclusive lock, then acquire shared lock
@@ -586,7 +693,7 @@ pub fn force_unmount(mount_point: &Path) -> miette::Result<()> {
         // Terminate the sidecar if it's still running, then clean up.
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
         };
 
         let (_, pid_path) = coordination_paths(mount_point);
@@ -621,7 +728,10 @@ mod tests {
     fn test_coordination_paths() {
         let mount_point = PathBuf::from("/tmp/envs/default");
         let (lock_path, pid_path) = coordination_paths(&mount_point);
-        assert_eq!(lock_path, PathBuf::from("/tmp/envs/default.rattler-fs.lock"));
+        assert_eq!(
+            lock_path,
+            PathBuf::from("/tmp/envs/default.rattler-fs.lock")
+        );
         assert_eq!(pid_path, PathBuf::from("/tmp/envs/default.rattler-fs.pid"));
     }
 
