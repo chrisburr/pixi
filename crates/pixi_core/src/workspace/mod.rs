@@ -611,26 +611,23 @@ impl Workspace {
     /// Returns a pre-filled command dispatcher builder that can be used to
     /// construct a [`pixi_command_dispatcher::CommandDispatcher`].
     pub fn command_dispatcher_builder(&self) -> miette::Result<CommandDispatcherBuilder> {
-        let mut cache_dir_iter = pixi_config::get_cache_dirs()?.into_iter();
-        let primary = cache_dir_iter
-            .next()
-            .expect("get_cache_dirs returns a non-empty Vec");
-        let fallbacks: Vec<_> = cache_dir_iter
-            .map(|p| {
-                AbsPathBuf::new(p)
-                    .expect("cache dir is not absolute")
-                    .into_assume_dir()
-            })
-            .collect();
-        let cache_dir = AbsPathBuf::new(primary)
+        let cache_dir = AbsPathBuf::new(pixi_config::get_cache_dir()?)
             .expect("cache dir is not absolute")
             .into_assume_dir();
         let workspace_dir = AbsPathBuf::new(self.pixi_dir())
             .expect("pixi dir is not absolute")
             .into_assume_dir();
+        let pkg_cache_layers: Vec<_> = pixi_config::get_pkg_cache_layers()
+            .into_iter()
+            .map(|p| {
+                AbsPathBuf::new(p)
+                    .expect("PIXI_PKG_CACHE_LAYERS entry is not absolute")
+                    .into_assume_dir()
+            })
+            .collect();
         let cache_dirs = CacheDirs::new(cache_dir)
             .with_workspace(workspace_dir)
-            .with_package_fallbacks(fallbacks);
+            .with_package_fallbacks(pkg_cache_layers);
 
         // Determine the tool platform to use
         let tool_platform = self.config().tool_platform();

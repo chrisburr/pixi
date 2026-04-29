@@ -142,16 +142,20 @@ impl CacheDirs {
             .unwrap_or_else(|| self.root.join(consts::CACHED_PACKAGES).into_assume_dir())
     }
 
-    /// Returns the package cache layers, in lookup order. The first entry is
-    /// the primary writable cache from [`Self::packages`]; subsequent entries
-    /// are derived from any fallback roots configured via
-    /// [`Self::with_package_fallbacks`].
+    /// Returns the package cache layers, in lookup order.
+    ///
+    /// The first entry is [`Self::packages`] (the primary cache root's
+    /// `pkgs/` subdirectory). Subsequent entries are taken verbatim from
+    /// the fallbacks configured via [`Self::with_package_fallbacks`]: each
+    /// is treated as a leaf package-cache directory (i.e. the entries in
+    /// rattler's `PackageCache::new_layered` sense, containing extracted
+    /// package subdirectories directly). This matches read-only shared
+    /// caches such as those exposed via CVMFS, where the package directory
+    /// layout is flat.
     pub fn packages_layered(&self) -> Vec<AbsPresumedDirPathBuf> {
         let mut layers = Vec::with_capacity(1 + self.package_fallbacks.len());
         layers.push(self.packages());
-        for fallback in &self.package_fallbacks {
-            layers.push(fallback.join(consts::CACHED_PACKAGES).into_assume_dir());
-        }
+        layers.extend(self.package_fallbacks.iter().cloned());
         layers
     }
 

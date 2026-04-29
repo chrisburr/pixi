@@ -69,8 +69,8 @@ pub struct Args {
 /// CLI entry point for `pixi exec`
 pub async fn execute(args: Args) -> miette::Result<()> {
     let config = Config::with_cli_config(&args.config);
-    let cache_dirs =
-        pixi_config::get_cache_dirs().context("failed to determine cache directory")?;
+    let cache_dir = pixi_config::get_cache_dir().context("failed to determine cache directory")?;
+    let pkg_cache_layers = pixi_config::get_pkg_cache_layers();
 
     let mut command_iter = args.command.iter();
     let command = command_iter.next().ok_or_else(|| miette::miette!(help ="i.e when specifying specs explicitly use a command at the end: `pixi exec -s python==3.12 python`", "missing required command to execute",))?;
@@ -100,7 +100,8 @@ pub async fn execute(args: Args) -> miette::Result<()> {
     let prefix = create_exec_prefix(
         &args,
         &install_specs,
-        &cache_dirs,
+        &cache_dir,
+        &pkg_cache_layers,
         &config,
         &client,
         should_guess_package,
@@ -165,15 +166,12 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 pub async fn create_exec_prefix(
     args: &Args,
     specs: &[MatchSpec],
-    cache_dirs: &[std::path::PathBuf],
+    cache_dir: &Path,
+    pkg_cache_layers: &[std::path::PathBuf],
     config: &Config,
     client: &ClientWithMiddleware,
     has_guessed_package: bool,
 ) -> miette::Result<Prefix> {
-    let cache_dir: &Path = cache_dirs
-        .first()
-        .expect("cache_dirs must be non-empty")
-        .as_path();
     let command = args.command.first().expect("missing required command");
     let specs = specs.to_vec();
 
@@ -310,9 +308,10 @@ pub async fn create_exec_prefix(
                 .finish(),
         )
         .with_package_cache(PackageCache::new_layered(
-            cache_dirs
-                .iter()
-                .map(|p| p.join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR)),
+            std::iter::once(
+                cache_dir.join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR),
+            )
+            .chain(pkg_cache_layers.iter().cloned()),
             false,
             ValidationMode::default(),
         ))
