@@ -230,6 +230,8 @@ pub struct Info {
     version: String,
     tls_backend: String,
     cache_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pkg_cache_layers: Vec<PathBuf>,
     cache_size: Option<String>,
     auth_dir: PathBuf,
     global_info: Option<GlobalInfo>,
@@ -274,6 +276,15 @@ impl Display for Info {
         }
 
         writeln!(f, "{:>WIDTH$}: {}", bold.apply_to("Cache dir"), cache_dir)?;
+        for (i, layer) in self.pkg_cache_layers.iter().enumerate() {
+            let label = if i == 0 { "Pkg cache layers" } else { "" };
+            writeln!(
+                f,
+                "{:>WIDTH$}: {}",
+                bold.apply_to(label),
+                layer.to_string_lossy()
+            )?;
+        }
         if let Some(cache_size) = &self.cache_size {
             writeln!(f, "{:>WIDTH$}: {}", bold.apply_to("Cache size"), cache_size)?;
         }
@@ -491,6 +502,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         version: consts::PIXI_VERSION.to_string(),
         tls_backend: tls_backend().to_string(),
         cache_dir: Some(pixi_config::get_cache_dir()?),
+        pkg_cache_layers: pixi_config::get_pkg_cache_layers(),
         cache_size,
         auth_dir: auth_file,
         project_info,
