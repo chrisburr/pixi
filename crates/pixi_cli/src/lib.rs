@@ -59,7 +59,7 @@ pub mod workspace;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "pixi",
+    name = "pixi-rattlerfs",
     version(consts::PIXI_VERSION),
     about = format!("
 Pixi [version {}] - Developer Workflow and Environment Management for Multi-Platform, Language-Agnostic Workspaces.

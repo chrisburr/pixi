@@ -11,7 +11,7 @@ pub fn executable_name() -> &'static str {
             .and_then(Path::file_stem)
             .and_then(OsStr::to_str)
             .map(String::from)
-            .unwrap_or("pixi".to_string())
+            .unwrap_or("pixi-rattlerfs".to_string())
     });
     PIXI_BIN_NAME.as_str()
 }

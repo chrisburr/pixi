@@ -219,6 +219,16 @@ cargo-wix = ">=0.3.9,<0.4"
 [feature.release.tasks]
 build-msi = { cmd = "python scripts/build_msi.py", description = "Build the Windows MSI installer with cargo-wix" }
 build-options = { cmd = "python scripts/build_options.py", description = "Write per-target build settings to GITHUB_ENV" }
+# Fully-static musl binary for local distribution as `pixi-rattlerfs`. conda-forge
+# has no linux musl rust-std, so the toolchain + target std come from rustup
+# (installed idempotently here); zig + cargo-zigbuild come from this env and
+# provide the musl C linker so apt/musl-tools is not needed. Requires rustup on
+# PATH. `self_update` is intentionally dropped so the fork can't overwrite itself
+# with upstream pixi. RUSTUP_TOOLCHAIN + ~/.cargo/bin on PATH pin the toolchain
+# so cargo-zigbuild can't fall back to an unrelated rustc injected earlier on
+# PATH (e.g. CERN cvmfs LbEnv 1.94). The release CI does the same build directly.
+# Output: target/x86_64-unknown-linux-musl/release/pixi-rattlerfs.
+build-static = { cmd = "rustup toolchain install 1.95.0 --target x86_64-unknown-linux-musl --no-self-update && export RUSTUP_TOOLCHAIN=1.95.0 && export PATH=\"$HOME/.cargo/bin:$PATH\" && cargo zigbuild --release --manifest-path crates/pixi/Cargo.toml --features performance --bin pixi --target x86_64-unknown-linux-musl && cp target/x86_64-unknown-linux-musl/release/pixi target/x86_64-unknown-linux-musl/release/pixi-rattlerfs", description = "Build a fully-static, self-update-disabled pixi-rattlerfs binary (requires rustup)" }
 create-release = { cmd = "python scripts/create_release.py", description = "Create the GitHub release with notes, checksums and artifacts" }
 create-tag = { cmd = "python scripts/create_tag.py", description = "Create and push the release git tag idempotently" }
 extract-version = { cmd = "python scripts/extract_version.py", description = "Print the release version and tag from crates/pixi/Cargo.toml" }
