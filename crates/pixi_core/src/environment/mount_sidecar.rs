@@ -115,7 +115,7 @@ fn tail_log(mount_point: &Path, max_bytes: usize) -> String {
 pub struct SidecarState {
     pub pid: u32,
     pub start_time: u64,
-    /// Environment identity hash (see `rattler_fs::compute_env_hash`). Recorded
+    /// Environment identity hash (see `rattler_vfs::compute_env_hash`). Recorded
     /// for diagnostics.
     pub env_hash: String,
     /// Hash of the `pixi.lock` bytes the sidecar mounted from. The reuse check
@@ -358,7 +358,7 @@ fn is_mountpoint(_path: &Path) -> bool {
 /// user-facing message in every mount path — the client side of `ensure_mount`
 /// for `pixi run` / `pixi shell` (the sidecar's own stderr goes to a log file),
 /// and `pixi mount` directly for the interactive path — while the mount itself
-/// honours the mapped rattler_fs policy as a backstop.
+/// honours the mapped rattler_vfs policy as a backstop.
 ///
 /// Returns an error only under [`pixi_config::OverlayMismatch::Error`]; `Warn`
 /// prints a warning and `Ignore` is silent, both letting the mount proceed. A
@@ -371,7 +371,7 @@ pub fn warn_or_error_on_overlay_mismatch(
     env_hash: &str,
     overlay_mismatch: pixi_config::OverlayMismatch,
 ) -> miette::Result<()> {
-    let Some(recorded) = rattler_fs::overlay::recorded_env_hash(overlay_dir) else {
+    let Some(recorded) = rattler_vfs::overlay::recorded_env_hash(overlay_dir) else {
         // No persistent overlay yet (read-only mount or first writable mount).
         return Ok(());
     };
@@ -424,7 +424,7 @@ fn enforce_overlay_mismatch_policy(
 ) -> miette::Result<()> {
     let overlay_dir = MountGuard::overlay_dir(env_dir);
     // Avoid parsing the lock file when there is no overlay to compare against.
-    if rattler_fs::overlay::recorded_env_hash(&overlay_dir).is_none() {
+    if rattler_vfs::overlay::recorded_env_hash(&overlay_dir).is_none() {
         return Ok(());
     }
 
@@ -438,7 +438,7 @@ fn enforce_overlay_mismatch_policy(
     let Ok(lock_file) = rattler_lock::LockFile::from_path(lock_file_path) else {
         return Ok(());
     };
-    let Ok(env_hash) = rattler_fs::compute_env_hash(&lock_file, env_name, platform) else {
+    let Ok(env_hash) = rattler_vfs::compute_env_hash(&lock_file, env_name, platform) else {
         return Ok(());
     };
 
@@ -1080,13 +1080,13 @@ fn cleanup_stale_state(env_dir: &Path, pid_path: &Path) -> miette::Result<()> {
 }
 
 /// Map the transport name recorded in the sidecar state back to a
-/// [`rattler_fs::Transport`].
-fn transport_from_name(name: &str) -> rattler_fs::Transport {
+/// [`rattler_vfs::Transport`].
+fn transport_from_name(name: &str) -> rattler_vfs::Transport {
     match name {
-        "fuse" => rattler_fs::Transport::Fuse,
-        "nfs" => rattler_fs::Transport::Nfs,
-        "projfs" => rattler_fs::Transport::ProjFs,
-        _ => rattler_fs::Transport::Auto,
+        "fuse" => rattler_vfs::Transport::Fuse,
+        "nfs" => rattler_vfs::Transport::Nfs,
+        "projfs" => rattler_vfs::Transport::ProjFs,
+        _ => rattler_vfs::Transport::Auto,
     }
 }
 
@@ -1094,7 +1094,7 @@ fn transport_from_name(name: &str) -> rattler_fs::Transport {
 /// (falling back to the platform default). Best-effort backstop for a stale
 /// mount left by a crashed or killed sidecar.
 ///
-/// Delegates to the transport-aware [`rattler_fs::force_unmount`] instead of the
+/// Delegates to the transport-aware [`rattler_vfs::force_unmount`] instead of the
 /// old FUSE-only `fusermount3` shell-out, which silently failed on Linux NFS
 /// mounts. On Windows, ProjFS virtualization stops when the owning sidecar
 /// process exits, so terminating the sidecar (the caller's job) is the teardown;
@@ -1103,11 +1103,11 @@ pub fn force_unmount(mount_point: &Path) -> miette::Result<()> {
     let (_, pid_path) = coordination_paths(mount_point);
     let transport = read_sidecar_state(&pid_path)
         .map(|s| transport_from_name(&s.transport))
-        .unwrap_or(rattler_fs::Transport::Auto);
+        .unwrap_or(rattler_vfs::Transport::Auto);
 
     #[cfg(unix)]
     {
-        rattler_fs::force_unmount(mount_point, transport)
+        rattler_vfs::force_unmount(mount_point, transport)
             .map_err(|e| miette!("failed to force-unmount {}: {e}", mount_point.display()))
     }
     #[cfg(windows)]

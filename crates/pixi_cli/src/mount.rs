@@ -88,22 +88,22 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 
     // The user-facing warning for an adopted overlay is printed client-side by
     // `ensure_mount` (the sidecar's stderr goes to a log file), so here `warn`
-    // and `ignore` both map to "adopt"; only `error` refuses inside rattler_fs.
+    // and `ignore` both map to "adopt"; only `error` refuses inside rattler_vfs.
     let overlay_mismatch = map_overlay_mismatch(workspace.config().mount_overlay_mismatch());
 
     let transport = match workspace.config().mount_backend() {
-        pixi_config::MountBackend::Auto => rattler_fs::Transport::Auto,
-        pixi_config::MountBackend::Nfs => rattler_fs::Transport::Nfs,
-        pixi_config::MountBackend::Fuse => rattler_fs::Transport::Fuse,
+        pixi_config::MountBackend::Auto => rattler_vfs::Transport::Auto,
+        pixi_config::MountBackend::Nfs => rattler_vfs::Transport::Nfs,
+        pixi_config::MountBackend::Fuse => rattler_vfs::Transport::Fuse,
     };
 
     // Reject an unavailable transport early with an actionable message instead
-    // of failing deep inside the mount (e.g. `fuse` on macOS needs rattler_fs
+    // of failing deep inside the mount (e.g. `fuse` on macOS needs rattler_vfs
     // built with the `fuse` feature / macFUSE; NFS is the macOS default).
     if !transport.is_available() {
         return Err(miette::miette!(
             "mount transport {transport:?} is not available on this platform/build. \
-             On macOS the FUSE backend requires macFUSE and rattler_fs built with the \
+             On macOS the FUSE backend requires macFUSE and rattler_vfs built with the \
              `fuse` feature; use the default `mount-backend = \"nfs\"` instead."
         ));
     }
@@ -118,7 +118,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
             pixi_config::get_cache_dir()?.join(pixi_consts::consts::CONDA_PACKAGE_CACHE_DIR),
         );
 
-        let env_hash = rattler_fs::compute_env_hash(&lock_file, env_name, platform)
+        let env_hash = rattler_vfs::compute_env_hash(&lock_file, env_name, platform)
             .map_err(|e| miette::miette!("failed to compute env hash: {e}"))?;
 
         let grace_period = workspace.config().mount_grace_period();
@@ -158,7 +158,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         )
         .await?;
 
-        let env_hash = rattler_fs::compute_env_hash(&lock_file_data.lock_file, env_name, platform)
+        let env_hash = rattler_vfs::compute_env_hash(&lock_file_data.lock_file, env_name, platform)
             .map_err(|e| miette::miette!("failed to compute env hash: {e}"))?;
 
         // Interactive mounts don't go through `ensure_mount`, so do the
@@ -188,14 +188,14 @@ pub async fn execute(args: Args) -> miette::Result<()> {
     }
 }
 
-/// Map the pixi overlay-mismatch config to the rattler_fs mount policy. Both
-/// `warn` and `ignore` adopt the overlay (rattler_fs has no separate "warn"
+/// Map the pixi overlay-mismatch config to the rattler_vfs mount policy. Both
+/// `warn` and `ignore` adopt the overlay (rattler_vfs has no separate "warn"
 /// state — pixi owns the user-facing message); only `error` refuses.
-fn map_overlay_mismatch(policy: pixi_config::OverlayMismatch) -> rattler_fs::OverlayMismatch {
+fn map_overlay_mismatch(policy: pixi_config::OverlayMismatch) -> rattler_vfs::OverlayMismatch {
     match policy {
-        pixi_config::OverlayMismatch::Error => rattler_fs::OverlayMismatch::Error,
+        pixi_config::OverlayMismatch::Error => rattler_vfs::OverlayMismatch::Error,
         pixi_config::OverlayMismatch::Warn | pixi_config::OverlayMismatch::Ignore => {
-            rattler_fs::OverlayMismatch::Adopt
+            rattler_vfs::OverlayMismatch::Adopt
         }
     }
 }
@@ -208,21 +208,21 @@ async fn execute_interactive(
     package_cache: &PackageCache,
     mount_point: &std::path::Path,
     overlay_dir: Option<PathBuf>,
-    overlay_mismatch: rattler_fs::OverlayMismatch,
+    overlay_mismatch: rattler_vfs::OverlayMismatch,
     env_hash: &str,
-    transport: rattler_fs::Transport,
+    transport: rattler_vfs::Transport,
 ) -> miette::Result<()> {
     fs_err::create_dir_all(mount_point).into_diagnostic()?;
 
     let config = if let Some(overlay_dir) = overlay_dir {
-        rattler_fs::MountConfig::new_writable(
+        rattler_vfs::MountConfig::new_writable(
             mount_point.to_path_buf(),
             Some(overlay_dir),
             transport,
             env_hash.to_string(),
         )
     } else {
-        rattler_fs::MountConfig::new_read_only_if_supported(
+        rattler_vfs::MountConfig::new_read_only_if_supported(
             mount_point.to_path_buf(),
             transport,
             env_hash.to_string(),
@@ -230,7 +230,7 @@ async fn execute_interactive(
     }
     .with_overlay_mismatch(overlay_mismatch);
 
-    let _handle = rattler_fs::build_and_mount(
+    let _handle = rattler_vfs::build_and_mount(
         lock_file,
         environment_name,
         platform,
@@ -270,10 +270,10 @@ async fn execute_managed(
     package_cache: &PackageCache,
     mount_point: &std::path::Path,
     overlay_dir: Option<PathBuf>,
-    overlay_mismatch: rattler_fs::OverlayMismatch,
+    overlay_mismatch: rattler_vfs::OverlayMismatch,
     env_hash: &str,
     lock_file_path: &std::path::Path,
-    transport: rattler_fs::Transport,
+    transport: rattler_vfs::Transport,
     grace_period: u64,
     pidfile: Option<&std::path::Path>,
     ready_fd: Option<i32>,
@@ -301,14 +301,14 @@ async fn execute_managed(
     let read_only = overlay_dir.is_none();
 
     let config = if let Some(overlay_dir) = overlay_dir {
-        rattler_fs::MountConfig::new_writable(
+        rattler_vfs::MountConfig::new_writable(
             mount_point.to_path_buf(),
             Some(overlay_dir),
             transport,
             env_hash.to_string(),
         )
     } else {
-        rattler_fs::MountConfig::new_read_only_if_supported(
+        rattler_vfs::MountConfig::new_read_only_if_supported(
             mount_point.to_path_buf(),
             transport,
             env_hash.to_string(),
@@ -316,7 +316,7 @@ async fn execute_managed(
     }
     .with_overlay_mismatch(overlay_mismatch);
 
-    let handle = rattler_fs::build_and_mount(
+    let handle = rattler_vfs::build_and_mount(
         lock_file,
         environment_name,
         platform,

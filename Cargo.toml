@@ -234,7 +234,7 @@ zstd = { version = "0.13.3", default-features = false }
 file_url = "0.3.0"
 rattler = { version = "0.47", default-features = false }
 rattler_cache = { version = "0.10", default-features = false }
-rattler_fs = { version = "0.1.0" }
+rattler_vfs = { version = "0.1.0" }
 rattler_conda_types = { version = "0.48", default-features = false, features = [
   "rayon",
 ] }
@@ -271,27 +271,37 @@ rattler_build_types = { version = "0.1.8" }
 rattler_build_variant_config = { version = "0.1.9" }
 
 [patch.crates-io]
-coalesced_map = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-file_url = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-path_resolver = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_cache = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_conda_types = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_digest = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_fs = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_index = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_lock = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_menuinst = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_networking = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_package_streaming = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_repodata_gateway = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_s3 = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_shell = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_solve = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_upload = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-rattler_virtual_packages = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
-simple_spawn_blocking = { git = "https://github.com/chrisburr/rattler", branch = "feat/rattler-fs" }
+coalesced_map = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+file_url = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+path_resolver = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_cache = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_conda_types = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_digest = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_vfs = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_index = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_lock = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_menuinst = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_networking = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_package_streaming = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_repodata_gateway = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_s3 = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_shell = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_solve = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_upload = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+rattler_virtual_packages = { git = "https://github.com/chrisburr/rattler", branch = "main" }
+simple_spawn_blocking = { git = "https://github.com/chrisburr/rattler", branch = "main" }
 version-ranges = { git = "https://github.com/astral-sh/pubgrub", rev = "d8efd77673c9a90792da9da31b6c0da7ea8a324b" }
+
+# rattler-build shim: the crates.io releases predate the fork's rattler (the
+# CEP-42 gateway API and the paths.json offsets fields), so consume them from
+# a branch of the fork pinned to the rattler_build_core-v0.2.8 publish tag
+# plus the minimal migration fixes.
+rattler_build_core = { git = "https://github.com/chrisburr/rattler-build", branch = "rattler-fs" }
+rattler_build_jinja = { git = "https://github.com/chrisburr/rattler-build", branch = "rattler-fs" }
+rattler_build_recipe = { git = "https://github.com/chrisburr/rattler-build", branch = "rattler-fs" }
+rattler_build_types = { git = "https://github.com/chrisburr/rattler-build", branch = "rattler-fs" }
+rattler_build_variant_config = { git = "https://github.com/chrisburr/rattler-build", branch = "rattler-fs" }
 
 # Redirect crates.io's `reqwest-middleware` to a local shim that re-exports
 # `astral-reqwest-middleware`. This unifies the `Middleware` trait identity

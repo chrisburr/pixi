@@ -249,6 +249,9 @@ pub async fn create_exec_prefix(
             .recursive(true)
             .execute()
             .await
+            // CEP-42 gateways return warnings alongside the repodata buckets;
+            // keep only the buckets, matching the pre-CEP-42 behavior here.
+            .map(|output| output.repodata)
             .into_diagnostic()
     })
     .await

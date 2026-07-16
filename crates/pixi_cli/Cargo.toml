@@ -68,7 +68,7 @@ pypi_modifiers = { workspace = true }
 rattler = { workspace = true, features = ["cli-tools", "indicatif"] }
 rattler_conda_types = { workspace = true }
 rattler_index = { workspace = true }
-rattler_fs = { workspace = true }
+rattler_vfs = { workspace = true }
 rattler_lock = { workspace = true }
 rattler_networking = { workspace = true, default-features = false }
 rattler_package_streaming = { workspace = true }

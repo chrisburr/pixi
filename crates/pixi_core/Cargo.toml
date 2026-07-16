@@ -62,7 +62,7 @@ pypi_modifiers = { workspace = true }
 rattler = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_digest = { workspace = true }
-rattler_fs = { workspace = true }
+rattler_vfs = { workspace = true }
 rattler_lock = { workspace = true }
 rattler_networking = { workspace = true, default-features = false }
 rattler_repodata_gateway = { workspace = true }
